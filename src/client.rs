@@ -30,13 +30,35 @@ pub struct InfisicalClient {
 }
 
 impl InfisicalClient {
-    pub fn new(config: Config) -> Self {
-        Self {
-            http: reqwest::Client::new(),
+    pub fn new(config: Config) -> Result<Self> {
+        Ok(Self {
+            http: Self::build_http()?,
             api_url: config.api_url,
             token: config.token,
             org_id: config.org_id,
-        }
+        })
+    }
+
+    /// A half-open socket is the one failure that produces *nothing* — no
+    /// output, no exit code — and on Linux it can sit there for roughly two
+    /// hours before TCP keepalive notices. That is the same hole the
+    /// `infisical` subprocess timeout closes, on the path that is actually hot,
+    /// so it gets the same treatment.
+    fn build_http() -> Result<reqwest::Client> {
+        reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(Self::request_timeout())
+            .build()
+            .map_err(|e| IfpError::Config(format!("cannot build HTTP client: {e}")))
+    }
+
+    fn request_timeout() -> std::time::Duration {
+        let secs = std::env::var("INF_HTTP_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|secs| *secs > 0)
+            .unwrap_or(30);
+        std::time::Duration::from_secs(secs)
     }
 
     /// Build a client from explicit parts, bypassing the `infisical` CLI.
@@ -44,7 +66,7 @@ impl InfisicalClient {
     #[cfg(test)]
     pub fn with_parts(api_url: &str, token: &str, org_id: &str) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: Self::build_http().expect("test HTTP client"),
             api_url: api_url.trim_end_matches('/').to_string(),
             token: token.to_string(),
             org_id: org_id.to_string(),
@@ -53,6 +75,7 @@ impl InfisicalClient {
 
     async fn request(&self, method: Method, path: &str, body: Option<&Value>) -> Result<String> {
         let url = format!("{}{}", self.api_url, path);
+        let method_label = method.to_string();
         let mut req = self
             .http
             .request(method, &url)
@@ -61,7 +84,19 @@ impl InfisicalClient {
             req = req.json(body);
         }
 
-        let response = req.send().await?;
+        let response = req.send().await.map_err(|e| {
+            if e.is_timeout() {
+                IfpError::HttpTimeout(format!(
+                    "{} {} did not answer within {}s. \
+                     Retry, or raise INF_HTTP_TIMEOUT_SECS",
+                    method_label,
+                    url,
+                    Self::request_timeout().as_secs()
+                ))
+            } else {
+                IfpError::Http(e)
+            }
+        })?;
         let status = response.status();
         let text = response.text().await.unwrap_or_default();
 

@@ -90,12 +90,20 @@ Both are accepted before or after the subcommand.
 ## Usage
 
 Projects and identities accept an id, an exact name, or a unique substring;
-projects also accept a slug. An exact match always wins; an ambiguous substring
-is an error listing the candidates, never a silent "first match".
+projects also accept a slug.
 
-Environments are matched exactly — by slug, id, or name (case-insensitively).
-Substrings are deliberately not accepted there, because `dev` would otherwise
-also match `development` and the losing case is a deleted environment.
+Exact matches are tried in precedence order — **id, then slug, then name** — and
+a tier that matches more than one record is an error listing the candidates,
+never a silent "first match". The tiers exist because Infisical enforces
+uniqueness on ids and slugs but *not* on names: two projects may share a name,
+and one project's slug may equal another's name. Without them the winner would
+depend on the order the API happened to return rows, which on `delete` means a
+silently wrong target.
+
+Environments are matched exactly — by id, slug, or name (case-insensitively),
+in that order. Substrings are deliberately not accepted there, because `dev`
+would otherwise also match `development` and the losing case is a deleted
+environment.
 
 ### Projects
 
@@ -229,14 +237,14 @@ Errors are JSON on stderr:
 `error` is a stable slug — match on it, not on `message`. The values are:
 `api_error`, `not_found`, `http_error`, `config_error`, `usage_error`,
 `confirmation_required`, `delete_protected`, `nothing_to_update`,
-`cli_not_found`, `not_logged_in`, `cli_failed`, `cli_timeout`, `token_expired`,
-`forbidden`, `no_match`, `ambiguous_match`, `aborted`.
+`http_timeout`, `cli_not_found`, `not_logged_in`, `cli_failed`, `cli_timeout`,
+`token_expired`, `forbidden`, `no_match`, `ambiguous_match`, `aborted`.
 
 The mechanically recoverable ones are worth special handling:
 `confirmation_required` (retry with `--yes`), `ambiguous_match` (pick a
 candidate id and retry), `not_logged_in` / `token_expired` (re-authenticate),
-`cli_timeout` (transient — retry), and `nothing_to_update` (the command was a
-no-op).
+`http_timeout` / `cli_timeout` (transient — retry), and `nothing_to_update`
+(the command was a no-op).
 
 A malformed command line — an unknown flag, a bad `--type` — is
 `usage_error`, not clap's English usage text. `--help` and `--version` are the
@@ -247,11 +255,19 @@ Exit codes:
 | Code | Meaning |
 |---|---|
 | `0` | Success |
-| `1` | The request failed — the server refused it (`api_error`, `forbidden`, `not_found`) or it could not be completed (`http_error`) |
+| `1` | The request failed — the server refused it (`api_error`, `forbidden`, `not_found`) or it could not be completed (`http_error`, `http_timeout`, `cli_timeout`) |
 | `2` | The invocation was wrong and something local must change — usage, config, session, or an unresolved/ambiguous query |
+| `141` | stdout was closed downstream (`\| head`), so `inf` died from `SIGPIPE` like any other Unix tool |
 
-The split is "would changing my command line have helped?". A refused connection
-would not have, so it is `1`, not `2`.
+The split is "would changing my command line have helped?". A refused
+connection, a request that timed out, and a wedged credential store would not
+have, so they are `1`, not `2`.
+
+Nothing waits forever: the HTTP client gives up after 30 seconds
+(`INF_HTTP_TIMEOUT_SECS`) with 10 to connect, and the `infisical` subprocess
+after 30 (`INF_CLI_TIMEOUT_SECS`). A half-open socket would otherwise stall a
+pipeline for the ~2 hours it takes TCP keepalive to notice, producing no output
+and no exit code at all.
 
 ## Scope
 

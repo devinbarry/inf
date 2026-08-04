@@ -55,9 +55,15 @@ fn install_shim(dir: &Path) {
 }
 
 /// A shim that never returns, standing in for a wedged keyring agent.
+///
+/// `exec` matters: dash does not exec-optimise the last command of a script, so
+/// a plain `sleep 300` would be a *grandchild*. `kill_on_drop` reaches only the
+/// direct child, so the sleeper would survive the test, be reparented to init,
+/// and linger for five minutes. `exec` makes the sleeper the process we spawn,
+/// which also makes this test assert the stronger thing.
 fn install_hanging_shim(dir: &Path) {
     let path = dir.join("infisical");
-    std::fs::write(&path, "#!/bin/sh\nsleep 300\n").unwrap();
+    std::fs::write(&path, "#!/bin/sh\nexec sleep 300\n").unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -69,6 +75,7 @@ struct Run {
     shim_dir: tempfile::TempDir,
     api_url: String,
     timeout_secs: Option<u64>,
+    http_timeout_secs: Option<u64>,
 }
 
 impl Run {
@@ -79,6 +86,7 @@ impl Run {
             shim_dir,
             api_url: api_url.to_string(),
             timeout_secs: None,
+            http_timeout_secs: None,
         }
     }
 
@@ -91,6 +99,7 @@ impl Run {
             shim_dir,
             api_url: "http://127.0.0.1:1".to_string(),
             timeout_secs: Some(1),
+            http_timeout_secs: None,
         }
     }
 
@@ -112,6 +121,9 @@ impl Run {
             .env("NO_COLOR", "1");
         if let Some(secs) = self.timeout_secs {
             command.env("INF_CLI_TIMEOUT_SECS", secs.to_string());
+        }
+        if let Some(secs) = self.http_timeout_secs {
+            command.env("INF_HTTP_TIMEOUT_SECS", secs.to_string());
         }
         command.output().expect("failed to run inf")
     }
@@ -663,6 +675,79 @@ async fn identity_get_reports_universal_auth_for_a_project_scoped_identity() {
 }
 
 #[tokio::test]
+async fn a_closed_stdout_does_not_panic() {
+    // `inf project ls | head -1` is an ordinary agent invocation. Rust ignores
+    // SIGPIPE by default, which turned the closed pipe into an EPIPE that
+    // `println!` answered with a panic: exit 101 — outside the documented set —
+    // and a Rust backtrace on stderr, which is not JSON.
+    let mut server = mockito::Server::new_async().await;
+    server
+        .mock("GET", "/api/v1/projects")
+        .with_status(200)
+        .with_body(TWO_PROJECTS)
+        .create_async()
+        .await;
+
+    let run = Run::new(&server.url());
+    let path = format!(
+        "{}:{}",
+        run.shim_dir.path().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(format!("'{}' project ls | head -1", bin().display()))
+        .env("PATH", path)
+        .env("INFISICAL_DOMAIN", &run.api_url)
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("failed to run pipeline");
+
+    let err = stderr(&output);
+    assert!(
+        !err.contains("panicked"),
+        "closed stdout panicked instead of exiting: {err}"
+    );
+    assert!(
+        !err.contains("Broken pipe"),
+        "leaked an EPIPE message: {err}"
+    );
+}
+
+#[tokio::test]
+async fn a_half_open_socket_times_out_instead_of_hanging() {
+    // A refused connection fails instantly; a server that ACCEPTs and then
+    // never answers does not. On Linux that socket can sit for ~2 hours before
+    // keepalive notices — no stdout, no stderr, no exit code, nothing for a
+    // caller to branch on. This is the same failure class the `infisical`
+    // subprocess timeout closes, on the path that is actually hot.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let accepted = std::thread::spawn(move || {
+        // Accept and hold the connection open without replying.
+        let _conn = listener.accept();
+        // Outlive the client's 1s timeout without slowing the suite.
+        std::thread::sleep(std::time::Duration::from_secs(3));
+    });
+
+    let mut run = Run::new(&format!("http://{addr}"));
+    run.http_timeout_secs = Some(1);
+
+    let started = std::time::Instant::now();
+    let output = run.exec(&["project", "ls"]);
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < std::time::Duration::from_secs(8),
+        "command did not give up promptly: {elapsed:?}"
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(stderr_json(&output)["error"], "http_timeout");
+    assert!(stdout(&output).is_empty());
+    let _ = accepted.join();
+}
+
+#[tokio::test]
 async fn a_wedged_infisical_cli_times_out_instead_of_hanging() {
     // Without a timeout a stuck credential backend hung every inf invocation
     // forever, producing no output at all — the worst failure for a caller that
@@ -676,7 +761,9 @@ async fn a_wedged_infisical_cli_times_out_instead_of_hanging() {
         elapsed < std::time::Duration::from_secs(20),
         "command did not give up promptly: {elapsed:?}"
     );
-    assert_eq!(output.status.code(), Some(2));
+    // Exit 1, not 2: nothing about the command line would have helped, and the
+    // remedy is to retry — the same rule that puts a refused connection in 1.
+    assert_eq!(output.status.code(), Some(1));
     let json = stderr_json(&output);
     assert_eq!(json["error"], "cli_timeout");
     assert!(stdout(&output).is_empty());
@@ -737,9 +824,10 @@ async fn identity_get_treats_a_404_as_no_universal_auth() {
 
     assert!(output.status.success(), "stderr: {}", stderr(&output));
     let json = stdout_json(&output);
+    // A missing method is a real result, not an error: the command succeeds and
+    // reports the absence.
     assert!(json["clientId"].is_null());
-    // A missing method is not an error, so no error field is reported.
-    assert!(json.get("universalAuthError").is_none());
+    assert!(json["universalAuth"].is_null());
 }
 
 #[tokio::test]

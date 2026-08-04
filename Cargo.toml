@@ -28,6 +28,7 @@ colored = "2"
 dirs = "5"
 base64 = "0.22"
 unicode-width = "0.2.2"
+libc = "0.2.189"
 
 [dev-dependencies]
 mockito = "1"

@@ -302,8 +302,25 @@ fn report(err: &error::IfpError, format: Format) {
     }
 }
 
+/// Restore the default `SIGPIPE` disposition.
+///
+/// Rust sets `SIGPIPE` to `SIG_IGN` at startup, which turns a closed stdout
+/// into an `EPIPE` that `println!` responds to by panicking — exit 101, with a
+/// Rust backtrace on stderr. `inf project ls | head -1` is an ordinary agent
+/// invocation, and it would produce both an exit code outside the documented
+/// set and a stderr that is not JSON. Dying from `SIGPIPE` like every other
+/// Unix tool is the honest behaviour.
+///
+/// Safe to call here: single-threaded, before the runtime or any I/O starts.
+fn restore_sigpipe() {
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
 #[tokio::main]
 async fn main() {
+    restore_sigpipe();
     let cli = parse_or_exit();
     let format = Format::new(cli.human);
 
@@ -323,7 +340,7 @@ async fn run(cli: Cli) -> Result<()> {
         return whoami(&config, format);
     }
 
-    let client = InfisicalClient::new(config);
+    let client = InfisicalClient::new(config)?;
 
     match cli.command {
         Commands::Whoami => unreachable!("handled above"),

@@ -1,17 +1,61 @@
+//! Resolving a human-typed query to exactly one object is the difference
+//! between a safe delete and a destructive one.
+//!
+//! The rule is deliberately strict: exact matches are tried in precedence
+//! order — id, then slug, then name — and a substring is only accepted when it
+//! matches a single candidate. Anything else is an error listing the
+//! candidates, never a silent "first match".
+//!
+//! The tiers matter because Infisical enforces uniqueness on ids and slugs but
+//! **not** on names: two projects may legitimately share a name, and one
+//! project's slug may equal another's name. Matching all three fields in one
+//! pass and taking the first hit made the winner depend on the order the API
+//! happened to return rows — and on `delete`, that is a silent wrong target.
+
 use crate::error::{Candidate, IfpError, Result};
 use crate::models::{Environment, IdentityMembership, Project};
 
-/// Resolving a human-typed query to exactly one object is the difference
-/// between a safe delete and a destructive one. The rule is deliberately
-/// strict: an exact id, slug or name always wins outright, and a substring is
-/// only accepted when it matches a single candidate. Anything else is an error
-/// listing the candidates — never a silent "first match".
+/// Collapse one precedence tier into a decision: nothing here, exactly one, or
+/// an ambiguity the caller must resolve.
+fn one_of<'a, T>(
+    matches: Vec<&'a T>,
+    query: &str,
+    describe: impl Fn(&T) -> Candidate,
+) -> Resolution<'a, T> {
+    match matches.len() {
+        0 => Resolution::None,
+        1 => Resolution::One(matches[0]),
+        _ => Resolution::Many(IfpError::AmbiguousMatch {
+            query: query.to_string(),
+            candidates: matches.into_iter().map(describe).collect(),
+        }),
+    }
+}
+
+enum Resolution<'a, T> {
+    None,
+    One(&'a T),
+    Many(IfpError),
+}
+
 pub fn project<'a>(projects: &'a [Project], query: &str) -> Result<&'a Project> {
-    if let Some(exact) = projects
-        .iter()
-        .find(|p| p.id == query || p.slug == query || p.name == query)
-    {
-        return Ok(exact);
+    let describe = |p: &Project| Candidate {
+        name: p.name.clone(),
+        id: p.id.clone(),
+        slug: Some(p.slug.clone()),
+    };
+
+    for field in [
+        (|p: &Project, q: &str| p.id == q) as fn(&Project, &str) -> bool,
+        |p, q| p.slug == q,
+        |p, q| p.name == q,
+    ] {
+        let tier: Vec<&Project> = projects.iter().filter(|p| field(p, query)).collect();
+        match one_of(tier, query, describe) {
+            Resolution::One(found) => return Ok(found),
+            Resolution::Many(err) => return Err(err),
+            Resolution::None => {}
+        }
     }
 
     let lowered = query.to_lowercase();
@@ -43,11 +87,27 @@ pub fn identity<'a>(
     identities: &'a [IdentityMembership],
     query: &str,
 ) -> Result<&'a IdentityMembership> {
-    if let Some(exact) = identities
-        .iter()
-        .find(|i| i.id() == query || i.name() == query)
-    {
-        return Ok(exact);
+    let describe = |i: &IdentityMembership| Candidate {
+        name: i.name().to_string(),
+        id: i.id().to_string(),
+        slug: None,
+    };
+
+    // Identities have no slug, so the tiers are id then name. Names are not
+    // unique — a failed `create` whose cleanup also failed leaves two
+    // identities sharing one — and that is exactly when a `delete` must refuse
+    // rather than guess.
+    for field in [
+        (|i: &IdentityMembership, q: &str| i.id() == q) as fn(&IdentityMembership, &str) -> bool,
+        |i, q| i.name() == q,
+    ] {
+        let tier: Vec<&IdentityMembership> =
+            identities.iter().filter(|i| field(i, query)).collect();
+        match one_of(tier, query, describe) {
+            Resolution::One(found) => return Ok(found),
+            Resolution::Many(err) => return Err(err),
+            Resolution::None => {}
+        }
     }
 
     let lowered = query.to_lowercase();
@@ -81,12 +141,31 @@ pub fn identity<'a>(
 /// Substrings are deliberately *not* accepted. `dev` would otherwise match
 /// `dev` and `development`, and the losing case is a deleted environment.
 pub fn environment<'a>(project: &'a Project, query: &str) -> Result<&'a Environment> {
-    if let Some(exact) = project
-        .environments
-        .iter()
-        .find(|e| e.slug == query || e.id == query || e.name == query)
-    {
-        return Ok(exact);
+    let describe = |e: &Environment| Candidate {
+        name: e.name.clone(),
+        id: e.id.clone(),
+        slug: Some(e.slug.clone()),
+    };
+
+    // Slug outranks name deliberately: the slug is what appears in every secret
+    // path, so it is what a caller typing `dev` almost always means. Without
+    // the tiers, an environment named `qa` sitting next to one *slugged* `qa`
+    // resolved by list order.
+    for field in [
+        (|e: &Environment, q: &str| e.id == q) as fn(&Environment, &str) -> bool,
+        |e, q| e.slug == q,
+        |e, q| e.name == q,
+    ] {
+        let tier: Vec<&Environment> = project
+            .environments
+            .iter()
+            .filter(|e| field(e, query))
+            .collect();
+        match one_of(tier, query, describe) {
+            Resolution::One(found) => return Ok(found),
+            Resolution::Many(err) => return Err(err),
+            Resolution::None => {}
+        }
     }
 
     let lowered = query.to_lowercase();
@@ -275,13 +354,66 @@ mod tests {
     }
 
     #[test]
-    fn environment_exact_match_wins_over_a_case_collision() {
-        let project = project_with_envs(serde_json::json!([
+    fn environment_slug_outranks_another_environments_name() {
+        // e1's *slug* is "qa"; e2's *name* is "qa". The slug is what appears in
+        // every secret path, so it wins — by the precedence rule, not by list
+        // order. This test used to pass only because of the fixture ordering:
+        // swapping the two entries flipped the answer.
+        let forward = project_with_envs(serde_json::json!([
             {"id": "e1", "name": "QA", "slug": "qa"},
             {"id": "e2", "name": "qa", "slug": "qa-eu"}
         ]));
-        assert_eq!(environment(&project, "qa").unwrap().id, "e1");
-        assert_eq!(environment(&project, "qa-eu").unwrap().id, "e2");
+        let reversed = project_with_envs(serde_json::json!([
+            {"id": "e2", "name": "qa", "slug": "qa-eu"},
+            {"id": "e1", "name": "QA", "slug": "qa"}
+        ]));
+
+        for project in [&forward, &reversed] {
+            assert_eq!(environment(project, "qa").unwrap().id, "e1");
+            assert_eq!(environment(project, "qa-eu").unwrap().id, "e2");
+        }
+    }
+
+    #[test]
+    fn duplicate_exact_names_are_ambiguous_not_first_match() {
+        // Infisical enforces uniqueness on ids and slugs but not on names, and
+        // a `create` whose cleanup also failed leaves two identities sharing
+        // one. Guessing here means deleting the wrong one.
+        let projects = vec![
+            project_fixture("p1", "Billing", "billing-a"),
+            project_fixture("p2", "Billing", "billing-b"),
+        ];
+        assert!(matches!(
+            project(&projects, "Billing"),
+            Err(IfpError::AmbiguousMatch { .. })
+        ));
+
+        let identities = vec![identity_fixture("i1", "ci"), identity_fixture("i2", "ci")];
+        let err = identity(&identities, "ci").unwrap_err();
+        assert!(matches!(err, IfpError::AmbiguousMatch { .. }));
+        let json = err.to_json();
+        assert_eq!(json["candidates"][0]["id"], "i1");
+        assert_eq!(json["candidates"][1]["id"], "i2");
+
+        let envs = project_with_envs(serde_json::json!([
+            {"id": "e1", "name": "QA", "slug": "qa-a"},
+            {"id": "e2", "name": "QA", "slug": "qa-b"}
+        ]));
+        assert!(matches!(
+            environment(&envs, "QA"),
+            Err(IfpError::AmbiguousMatch { .. })
+        ));
+    }
+
+    #[test]
+    fn an_id_outranks_another_records_slug_or_name() {
+        // An id is the least ambiguous thing a caller can pass, so it must win
+        // outright even when the same string is someone else's slug.
+        let projects = vec![
+            project_fixture("shared", "Alpha", "alpha"),
+            project_fixture("p2", "Beta", "shared"),
+        ];
+        assert_eq!(project(&projects, "shared").unwrap().name, "Alpha");
     }
 
     #[test]

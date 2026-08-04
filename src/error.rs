@@ -45,6 +45,12 @@ pub enum IfpError {
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
 
+    /// The instance accepted the connection and then never answered. Its own
+    /// kind for the same reason as `CliTimeout`: transient and worth retrying,
+    /// unlike a refused connection or a rejected request.
+    #[error("HTTP timeout: {0}")]
+    HttpTimeout(String),
+
     #[error("Config error: {0}")]
     Config(String),
 
@@ -130,7 +136,12 @@ impl IfpError {
             IfpError::Api(_)
             | IfpError::NotFound(_)
             | IfpError::Forbidden(_)
-            | IfpError::Http(_) => 1,
+            | IfpError::Http(_)
+            | IfpError::HttpTimeout(_)
+            // A wedged credential store is not a usage mistake either: nothing
+            // about the command line would have helped, and the remedy is to
+            // retry rather than to change the invocation.
+            | IfpError::CliTimeout(_) => 1,
             IfpError::Annotated { source, .. } => source.exit_code(),
             _ => 2,
         }
@@ -152,6 +163,7 @@ impl IfpError {
             IfpError::Api(_) => "api_error",
             IfpError::NotFound(_) => "not_found",
             IfpError::Http(_) => "http_error",
+            IfpError::HttpTimeout(_) => "http_timeout",
             IfpError::Config(_) => "config_error",
             IfpError::Usage(_) => "usage_error",
             IfpError::ConfirmationRequired(_) => "confirmation_required",
