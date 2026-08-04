@@ -5,6 +5,16 @@ use reqwest::{Method, StatusCode};
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 
+/// Identity listings are paginated and default to 20 rows — small enough that
+/// an organization of any size silently loses identities from the tail, which
+/// then resolve as "no match". 1000 is the server's maximum page size; we walk
+/// pages until one comes back short.
+const PAGE_LIMIT: usize = 1000;
+
+/// Backstop against a server that ignores `limit` and returns a full page
+/// forever. At 1000 rows a page this is far beyond any real organization.
+const MAX_PAGES: usize = 100;
+
 pub struct InfisicalClient {
     http: reqwest::Client,
     api_url: String,
@@ -62,6 +72,7 @@ impl InfisicalClient {
                 Self::extract_message(&text)
             )),
             StatusCode::UNAUTHORIZED => IfpError::NotLoggedIn,
+            StatusCode::NOT_FOUND => IfpError::NotFound(Self::extract_message(&text)),
             _ => IfpError::Api(format!("{} {}", status, Self::extract_message(&text))),
         })
     }
@@ -91,6 +102,18 @@ impl InfisicalClient {
         body: &Value,
     ) -> Result<T> {
         let text = self.request(method, path, Some(body)).await?;
+        Self::parse(&text)
+    }
+
+    /// For routes whose body we pass straight through. A mutation that answers
+    /// `204 No Content` is a success, not a parse failure — treating an empty
+    /// body as an error made successful PATCHes report
+    /// "unexpected response shape: EOF while parsing a value".
+    async fn send_value(&self, method: Method, path: &str, body: &Value) -> Result<Value> {
+        let text = self.request(method, path, Some(body)).await?;
+        if text.trim().is_empty() {
+            return Ok(Value::Null);
+        }
         Self::parse(&text)
     }
 
@@ -197,7 +220,7 @@ impl InfisicalClient {
         slug: &str,
     ) -> Result<Value> {
         let body = json!({ "name": name, "slug": slug });
-        self.send_json(
+        self.send_value(
             Method::POST,
             &format!("/v1/projects/{project_id}/environments"),
             &body,
@@ -219,7 +242,7 @@ impl InfisicalClient {
         if let Some(slug) = slug {
             body["slug"] = json!(slug);
         }
-        self.send_json(
+        self.send_value(
             Method::PATCH,
             &format!("/v1/projects/{project_id}/environments/{env_id}"),
             &body,
@@ -239,20 +262,41 @@ impl InfisicalClient {
 
     // -- Machine identities --
 
+    /// Walks every page. The route defaults to 20 rows and caps at 1000, so a
+    /// single unpaginated call quietly drops the 21st identity onward — and a
+    /// dropped identity resolves as "no match", not as an error.
     pub async fn list_identities(&self) -> Result<Vec<IdentityMembership>> {
         #[derive(serde::Deserialize)]
         struct Response {
             identities: Vec<IdentityMembership>,
         }
-        let response: Response = self
-            .get_json(&format!("/v1/identities?orgId={}", self.org_id))
-            .await?;
-        Ok(response.identities)
+        let mut all = Vec::new();
+        let mut offset = 0usize;
+        for _ in 0..MAX_PAGES {
+            let page: Response = self
+                .get_json(&format!(
+                    "/v1/identities?orgId={}&limit={PAGE_LIMIT}&offset={offset}",
+                    self.org_id
+                ))
+                .await?;
+            let count = page.identities.len();
+            all.extend(page.identities);
+            if count < PAGE_LIMIT {
+                break;
+            }
+            offset += count;
+        }
+        Ok(all)
     }
 
     /// Create an identity scoped to a single project. Unlike an org identity
     /// it is confined to that project from the moment it exists, so a leaked
     /// credential cannot be pointed at anything else.
+    ///
+    /// `roles` is honoured from Infisical v0.162.0 onward. Older servers accept
+    /// the field, strip it, and land the identity on `no-access` — which is why
+    /// the caller still applies the role explicitly afterwards. Sending it here
+    /// costs nothing and gets the role right in one call on current servers.
     pub async fn create_project_identity(
         &self,
         project_id: &str,
@@ -271,13 +315,37 @@ impl InfisicalClient {
         .await
     }
 
-    /// Rename only. The `role` field on this route sets the *organization*
-    /// role, which `inf` never grants, so it is deliberately not exposed.
+    /// Rename an organization-level identity.
+    ///
+    /// This route refuses project-scoped identities outright — `updateIdentity`
+    /// in the backend rejects any identity with a `projectId` with
+    /// "Identity is managed by project", exactly as the delete route does. Use
+    /// [`update_project_identity`] for those.
+    ///
+    /// The `role` field on this route sets the *organization* role, which `inf`
+    /// never grants, so it is deliberately not exposed.
     pub async fn update_identity(&self, identity_id: &str, name: &str) -> Result<Value> {
         let body = json!({ "name": name });
-        self.send_json(
+        self.send_value(
             Method::PATCH,
             &format!("/v1/identities/{identity_id}"),
+            &body,
+        )
+        .await
+    }
+
+    /// Rename a project-scoped identity. The organization route rejects these,
+    /// so scope decides which of the two is correct.
+    pub async fn update_project_identity(
+        &self,
+        project_id: &str,
+        identity_id: &str,
+        name: &str,
+    ) -> Result<Value> {
+        let body = json!({ "name": name });
+        self.send_value(
+            Method::PATCH,
+            &format!("/v1/projects/{project_id}/identities/{identity_id}"),
             &body,
         )
         .await
@@ -357,6 +425,8 @@ impl InfisicalClient {
 
     // -- Project membership for identities --
 
+    /// Paginated for the same reason as [`list_identities`]: the default page
+    /// is 20 rows.
     pub async fn list_project_identities(
         &self,
         project_id: &str,
@@ -366,22 +436,35 @@ impl InfisicalClient {
             #[serde(rename = "identityMemberships")]
             memberships: Vec<IdentityMembership>,
         }
-        let response: Response = self
-            .get_json(&format!("/v1/projects/{project_id}/memberships/identities"))
-            .await?;
-        Ok(response.memberships)
+        let mut all = Vec::new();
+        let mut offset = 0usize;
+        for _ in 0..MAX_PAGES {
+            let page: Response = self
+                .get_json(&format!(
+                    "/v1/projects/{project_id}/memberships/identities?limit={PAGE_LIMIT}&offset={offset}"
+                ))
+                .await?;
+            let count = page.memberships.len();
+            all.extend(page.memberships);
+            if count < PAGE_LIMIT {
+                break;
+            }
+            offset += count;
+        }
+        Ok(all)
     }
 
-    /// The create route accepts a `roles` array but does not apply it — a new
-    /// project identity always lands on `no-access`. Setting the role is a
-    /// separate membership update, which this performs.
+    /// Applying the role is a separate membership update. On servers older than
+    /// v0.162.0 the `roles` array on the create route is stripped and the
+    /// identity lands on `no-access`, so this call is what actually grants the
+    /// requested role there; on newer servers it is a harmless no-op re-assert.
     pub async fn set_project_identity_role(
         &self,
         project_id: &str,
         identity_id: &str,
         role: &str,
     ) -> Result<Value> {
-        self.send_json(
+        self.send_value(
             Method::PATCH,
             &format!("/v1/projects/{project_id}/memberships/identities/{identity_id}"),
             &json!({ "roles": [{ "role": role, "isTemporary": false }] }),
@@ -444,10 +527,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_identities_scopes_by_org_from_token() {
+    async fn list_identities_scopes_by_org_and_requests_a_full_page() {
         let mut server = mockito::Server::new_async().await;
+        // The default page is 20 rows; without an explicit limit the 21st
+        // identity onward vanishes and then resolves as "no match".
         let mock = server
-            .mock("GET", "/v1/identities?orgId=org-42")
+            .mock("GET", "/v1/identities")
+            .match_query(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("orgId".into(), "org-42".into()),
+                mockito::Matcher::UrlEncoded("limit".into(), PAGE_LIMIT.to_string()),
+                mockito::Matcher::UrlEncoded("offset".into(), "0".into()),
+            ]))
             .with_status(200)
             .with_body(
                 r#"{"identities":[{"identityId":"i1","role":"admin",
@@ -462,6 +552,70 @@ mod tests {
         mock.assert_async().await;
         assert_eq!(identities[0].name(), "ci");
         assert_eq!(identities[0].id(), "i1");
+    }
+
+    #[tokio::test]
+    async fn list_identities_walks_every_page() {
+        let mut server = mockito::Server::new_async().await;
+        // A full page means "there may be more"; a short page ends the walk.
+        let full: Vec<String> = (0..PAGE_LIMIT)
+            .map(|n| {
+                format!(
+                    r#"{{"identityId":"i{n}","identity":{{"id":"i{n}","name":"id-{n}","authMethods":[]}}}}"#
+                )
+            })
+            .collect();
+        let first = server
+            .mock("GET", "/v1/identities")
+            .match_query(mockito::Matcher::UrlEncoded("offset".into(), "0".into()))
+            .with_status(200)
+            .with_body(format!(r#"{{"identities":[{}]}}"#, full.join(",")))
+            .create_async()
+            .await;
+        let second = server
+            .mock("GET", "/v1/identities")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "offset".into(),
+                PAGE_LIMIT.to_string(),
+            ))
+            .with_status(200)
+            .with_body(
+                r#"{"identities":[{"identityId":"tail","identity":{"id":"tail","name":"last","authMethods":[]}}]}"#,
+            )
+            .create_async()
+            .await;
+
+        let client = InfisicalClient::with_parts(&server.url(), "t", "org-1");
+        let identities = client.list_identities().await.unwrap();
+
+        first.assert_async().await;
+        second.assert_async().await;
+        assert_eq!(identities.len(), PAGE_LIMIT + 1);
+        assert_eq!(identities.last().unwrap().name(), "last");
+    }
+
+    #[tokio::test]
+    async fn list_project_identities_requests_a_full_page() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/v1/projects/p1/memberships/identities")
+            .match_query(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("limit".into(), PAGE_LIMIT.to_string()),
+                mockito::Matcher::UrlEncoded("offset".into(), "0".into()),
+            ]))
+            .with_status(200)
+            .with_body(
+                r#"{"identityMemberships":[{"identityId":"i1","roles":[{"role":"viewer","customRoleSlug":null}],
+                   "identity":{"id":"i1","name":"ci","authMethods":[]}}]}"#,
+            )
+            .create_async()
+            .await;
+
+        let client = InfisicalClient::with_parts(&server.url(), "t", "org-1");
+        let memberships = client.list_project_identities("p1").await.unwrap();
+
+        mock.assert_async().await;
+        assert_eq!(memberships[0].role(), "viewer");
     }
 
     #[tokio::test]
@@ -511,6 +665,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn project_scoped_rename_uses_the_project_route() {
+        let mut server = mockito::Server::new_async().await;
+        // The org route rejects project-scoped identities with
+        // "Identity is managed by project", so scope must pick the route.
+        let mock = server
+            .mock("PATCH", "/v1/projects/p1/identities/i1")
+            .match_body(mockito::Matcher::Json(json!({"name": "renamed"})))
+            .with_status(200)
+            .with_body(r#"{"identity":{"id":"i1","name":"renamed"}}"#)
+            .create_async()
+            .await;
+
+        let client = InfisicalClient::with_parts(&server.url(), "t", "org-1");
+        client
+            .update_project_identity("p1", "i1", "renamed")
+            .await
+            .unwrap();
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
     async fn forbidden_is_reported_with_a_hint() {
         let mut server = mockito::Server::new_async().await;
         server
@@ -548,6 +723,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn not_found_is_its_own_error_kind() {
+        let mut server = mockito::Server::new_async().await;
+        // `client-secret` distinguishes "Universal Auth not attached yet" from
+        // "your session died"; both used to arrive as a generic Api error.
+        server
+            .mock("GET", "/v1/auth/universal-auth/identities/i1")
+            .with_status(404)
+            .with_body(r#"{"message":"not configured"}"#)
+            .create_async()
+            .await;
+
+        let client = InfisicalClient::with_parts(&server.url(), "t", "org-1");
+        let err = client.get_universal_auth("i1").await.unwrap_err();
+        assert!(matches!(err, IfpError::NotFound(_)));
+    }
+
+    #[tokio::test]
     async fn delete_project_tolerates_empty_body() {
         let mut server = mockito::Server::new_async().await;
         let mock = server
@@ -560,5 +752,27 @@ mod tests {
         let client = InfisicalClient::with_parts(&server.url(), "t", "org-1");
         client.delete_project("p1").await.unwrap();
         mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn mutations_tolerate_an_empty_body() {
+        let mut server = mockito::Server::new_async().await;
+        // A 204 is a successful PATCH. Parsing it as JSON reported
+        // "unexpected response shape: EOF while parsing a value" *after* the
+        // change had already been applied.
+        let mock = server
+            .mock("PATCH", "/v1/projects/p1/memberships/identities/i1")
+            .with_status(204)
+            .with_body("")
+            .create_async()
+            .await;
+
+        let client = InfisicalClient::with_parts(&server.url(), "t", "org-1");
+        let value = client
+            .set_project_identity_role("p1", "i1", "viewer")
+            .await
+            .unwrap();
+        mock.assert_async().await;
+        assert!(value.is_null());
     }
 }

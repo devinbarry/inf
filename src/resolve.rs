@@ -1,5 +1,5 @@
-use crate::error::{IfpError, Result};
-use crate::models::{IdentityMembership, Project};
+use crate::error::{Candidate, IfpError, Result};
+use crate::models::{Environment, IdentityMembership, Project};
 
 /// Resolving a human-typed query to exactly one object is the difference
 /// between a safe delete and a destructive one. The rule is deliberately
@@ -29,9 +29,12 @@ pub fn project<'a>(projects: &'a [Project], query: &str) -> Result<&'a Project> 
             query: query.to_string(),
             candidates: matches
                 .iter()
-                .map(|p| format!("  {} ({})", p.name, p.slug))
-                .collect::<Vec<_>>()
-                .join("\n"),
+                .map(|p| Candidate {
+                    name: p.name.clone(),
+                    id: p.id.clone(),
+                    slug: Some(p.slug.clone()),
+                })
+                .collect(),
         }),
     }
 }
@@ -60,43 +63,64 @@ pub fn identity<'a>(
             query: query.to_string(),
             candidates: matches
                 .iter()
-                .map(|i| format!("  {} ({})", i.name(), i.id()))
-                .collect::<Vec<_>>()
-                .join("\n"),
+                .map(|i| Candidate {
+                    name: i.name().to_string(),
+                    id: i.id().to_string(),
+                    slug: None,
+                })
+                .collect(),
         }),
     }
 }
 
-/// Environments are scoped to one project, so a slug match is unambiguous and
-/// the name is accepted only as a convenience.
-pub fn environment<'a>(
-    project: &'a Project,
-    query: &str,
-) -> Result<&'a crate::models::Environment> {
-    project
+/// Environments are scoped to one project, so an exact slug, id or name is
+/// unambiguous. A case-insensitive name is accepted as a convenience — but it
+/// is resolved under the same rule as everything else here: two environments
+/// differing only in case are an error, not a coin flip.
+///
+/// Substrings are deliberately *not* accepted. `dev` would otherwise match
+/// `dev` and `development`, and the losing case is a deleted environment.
+pub fn environment<'a>(project: &'a Project, query: &str) -> Result<&'a Environment> {
+    if let Some(exact) = project
         .environments
         .iter()
         .find(|e| e.slug == query || e.id == query || e.name == query)
-        .or_else(|| {
-            let lowered = query.to_lowercase();
+    {
+        return Ok(exact);
+    }
+
+    let lowered = query.to_lowercase();
+    let matches: Vec<&Environment> = project
+        .environments
+        .iter()
+        .filter(|e| e.name.to_lowercase() == lowered || e.slug.to_lowercase() == lowered)
+        .collect();
+
+    match matches.len() {
+        1 => Ok(matches[0]),
+        0 => Err(IfpError::NoMatch(format!(
+            "no environment '{}' in project '{}' (have: {})",
+            query,
+            project.name,
             project
                 .environments
                 .iter()
-                .find(|e| e.name.to_lowercase() == lowered)
-        })
-        .ok_or_else(|| {
-            IfpError::NoMatch(format!(
-                "no environment '{}' in project '{}' (have: {})",
-                query,
-                project.name,
-                project
-                    .environments
-                    .iter()
-                    .map(|e| e.slug.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ))
-        })
+                .map(|e| e.slug.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
+        _ => Err(IfpError::AmbiguousMatch {
+            query: query.to_string(),
+            candidates: matches
+                .iter()
+                .map(|e| Candidate {
+                    name: e.name.clone(),
+                    id: e.id.clone(),
+                    slug: Some(e.slug.clone()),
+                })
+                .collect(),
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -114,6 +138,13 @@ mod tests {
         serde_json::from_value(serde_json::json!({
             "identityId": id,
             "identity": {"id": id, "name": name, "authMethods": []}
+        }))
+        .unwrap()
+    }
+
+    fn project_with_envs(envs: serde_json::Value) -> Project {
+        serde_json::from_value(serde_json::json!({
+            "id": "p1", "name": "billing", "slug": "billing", "environments": envs
         }))
         .unwrap()
     }
@@ -156,6 +187,11 @@ mod tests {
         assert!(msg.contains("billing-api"));
         assert!(msg.contains("billing-web"));
         assert_eq!(err.exit_code(), 2);
+
+        // Agents disambiguate by id, so the ids must survive into the payload.
+        let json = err.to_json();
+        assert_eq!(json["candidates"][0]["id"], "p1");
+        assert_eq!(json["candidates"][1]["id"], "p2");
     }
 
     #[test]
@@ -190,28 +226,70 @@ mod tests {
             identity_fixture("i1", "ci-deployer-a"),
             identity_fixture("i2", "ci-deployer-b"),
         ];
-        assert!(matches!(
-            identity(&identities, "ci-deployer"),
-            Err(IfpError::AmbiguousMatch { .. })
-        ));
+        let err = identity(&identities, "ci-deployer").unwrap_err();
+        assert!(matches!(err, IfpError::AmbiguousMatch { .. }));
+        // Identities have no slug, so the candidate carries only name and id.
+        let json = err.to_json();
+        assert_eq!(json["candidates"][0]["id"], "i1");
+        assert!(json["candidates"][0].get("slug").is_none());
     }
 
     #[test]
     fn environment_resolves_by_slug_and_lists_options_when_missing() {
-        let project: Project = serde_json::from_value(serde_json::json!({
-            "id": "p1", "name": "billing", "slug": "billing",
-            "environments": [
-                {"id": "e1", "name": "Development", "slug": "dev"},
-                {"id": "e2", "name": "Production", "slug": "prod"}
-            ]
-        }))
-        .unwrap();
+        let project = project_with_envs(serde_json::json!([
+            {"id": "e1", "name": "Development", "slug": "dev"},
+            {"id": "e2", "name": "Production", "slug": "prod"}
+        ]));
 
         assert_eq!(environment(&project, "dev").unwrap().id, "e1");
         assert_eq!(environment(&project, "Production").unwrap().id, "e2");
 
         let err = environment(&project, "staging").unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("dev, prod"));
+        assert!(err.to_string().contains("dev, prod"));
+    }
+
+    #[test]
+    fn environment_matches_name_case_insensitively() {
+        // This fallback previously had no coverage at all.
+        let project = project_with_envs(serde_json::json!([
+            {"id": "e1", "name": "Development", "slug": "dev"}
+        ]));
+        assert_eq!(environment(&project, "development").unwrap().id, "e1");
+        assert_eq!(environment(&project, "DEVELOPMENT").unwrap().id, "e1");
+    }
+
+    #[test]
+    fn environment_case_collision_is_ambiguous_not_first_match() {
+        // The fallback used to take the first match silently, contradicting
+        // this module's own rule — and the losing case is a deleted
+        // environment full of secrets.
+        let project = project_with_envs(serde_json::json!([
+            {"id": "e1", "name": "QA", "slug": "qa"},
+            {"id": "e2", "name": "qa", "slug": "qa-eu"}
+        ]));
+        let err = environment(&project, "Qa").unwrap_err();
+        assert!(matches!(err, IfpError::AmbiguousMatch { .. }));
+        let json = err.to_json();
+        assert_eq!(json["candidates"][0]["id"], "e1");
+        assert_eq!(json["candidates"][1]["id"], "e2");
+    }
+
+    #[test]
+    fn environment_exact_match_wins_over_a_case_collision() {
+        let project = project_with_envs(serde_json::json!([
+            {"id": "e1", "name": "QA", "slug": "qa"},
+            {"id": "e2", "name": "qa", "slug": "qa-eu"}
+        ]));
+        assert_eq!(environment(&project, "qa").unwrap().id, "e1");
+        assert_eq!(environment(&project, "qa-eu").unwrap().id, "e2");
+    }
+
+    #[test]
+    fn environment_does_not_accept_substrings() {
+        // `dev` must not silently select `development`.
+        let project = project_with_envs(serde_json::json!([
+            {"id": "e1", "name": "Development", "slug": "development"}
+        ]));
+        assert!(environment(&project, "dev").is_err());
     }
 }

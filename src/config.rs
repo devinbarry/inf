@@ -104,22 +104,67 @@ impl Config {
             })?;
 
         if !output.status.success() {
-            return Err(IfpError::NotLoggedIn);
+            // Not every failure is a missing session: a locked keyring or an
+            // unreadable config file also exit non-zero. Sending those users to
+            // `infisical login` wastes their time, so keep the CLI's own
+            // diagnosis when it offered one.
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let detail = stderr.trim();
+            return Err(if detail.is_empty() || Self::mentions_login(detail) {
+                IfpError::NotLoggedIn
+            } else {
+                IfpError::CliFailed(detail.to_string())
+            });
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         Self::extract_jwt(&stdout).ok_or(IfpError::NotLoggedIn)
     }
 
+    fn mentions_login(stderr: &str) -> bool {
+        let lowered = stderr.to_lowercase();
+        lowered.contains("logged in") || lowered.contains("login")
+    }
+
     /// The CLI interleaves migration notices with command output, and `--silent`
     /// has not always suppressed them. Pick the line that is actually a JWT
     /// rather than trusting stdout to hold nothing else.
+    ///
+    /// Counting dots is not enough: `https://artifacts.infisical.com` is three
+    /// non-empty dot-separated segments too, and being *first* it used to win —
+    /// so a banner containing any URL broke every command with a bogus
+    /// "cannot decode session token". A JWT's segments are base64url and its
+    /// header decodes to a JSON object naming an algorithm; check that instead.
     fn extract_jwt(stdout: &str) -> Option<String> {
         stdout
             .lines()
             .map(str::trim)
-            .find(|line| line.split('.').count() == 3 && line.split('.').all(|seg| !seg.is_empty()))
+            .find(|line| Self::is_jwt(line))
             .map(str::to_string)
+    }
+
+    fn is_jwt(candidate: &str) -> bool {
+        let segments: Vec<&str> = candidate.split('.').collect();
+        if segments.len() != 3 {
+            return false;
+        }
+        if !segments
+            .iter()
+            .all(|seg| !seg.is_empty() && seg.bytes().all(Self::is_base64url_byte))
+        {
+            return false;
+        }
+        // The header is the cheapest segment to validate and the only one whose
+        // shape is fixed by the JWT spec.
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(segments[0])
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .is_some_and(|header| header.get("alg").and_then(|a| a.as_str()).is_some())
+    }
+
+    fn is_base64url_byte(byte: u8) -> bool {
+        byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'
     }
 
     fn decode_payload(token: &str) -> Result<JwtPayload> {
@@ -205,10 +250,13 @@ mod tests {
     use super::*;
     use base64::Engine;
 
+    fn b64(value: &serde_json::Value) -> String {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(value).unwrap())
+    }
+
     fn make_token(payload: &serde_json::Value) -> String {
-        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(serde_json::to_vec(payload).unwrap());
-        format!("header.{encoded}.signature")
+        let header = b64(&serde_json::json!({"alg": "HS256", "typ": "JWT"}));
+        format!("{header}.{}.c2lnbmF0dXJl", b64(payload))
     }
 
     #[test]
@@ -241,10 +289,32 @@ mod tests {
 
     #[test]
     fn extract_jwt_ignores_migration_notices() {
-        let stdout = "Important: the Infisical CLI package repository is moving.\n\
-                      What to do: repoint your machine to the new host.\n\
-                      aaa.bbb.ccc\n";
-        assert_eq!(Config::extract_jwt(stdout).as_deref(), Some("aaa.bbb.ccc"));
+        let token = make_token(&serde_json::json!({"organizationId": "org-1"}));
+        let stdout = format!(
+            "Important: the Infisical CLI package repository is moving.\n\
+             What to do: repoint your machine to the new host.\n\
+             {token}\n"
+        );
+        assert_eq!(
+            Config::extract_jwt(&stdout).as_deref(),
+            Some(token.as_str())
+        );
+    }
+
+    #[test]
+    fn extract_jwt_skips_a_url_printed_before_the_token() {
+        // A URL is three non-empty dot-separated segments, so a dot count picks
+        // the banner instead of the token — and because it comes first, every
+        // command then failed with "cannot decode session token" for a user who
+        // was correctly logged in.
+        let token = make_token(&serde_json::json!({"organizationId": "org-1"}));
+        let stdout = format!(
+            "Important: repoint your machine to https://artifacts-p.infisical.com\n{token}\n"
+        );
+        assert_eq!(
+            Config::extract_jwt(&stdout).as_deref(),
+            Some(token.as_str())
+        );
     }
 
     #[test]
@@ -252,6 +322,22 @@ mod tests {
         assert!(Config::extract_jwt("no token here\njust noise\n").is_none());
         // A sentence with two full stops must not be mistaken for a JWT.
         assert!(Config::extract_jwt("a.b.\n").is_none());
+        // Nor a bare hostname, version string, or IP address.
+        assert!(Config::extract_jwt("see docs.infisical.com\n").is_none());
+        assert!(Config::extract_jwt("infisical v0.43.116\n").is_none());
+        assert!(Config::extract_jwt("connect to 192.0.2.10\n").is_none());
+        // Three base64url-looking segments whose header is not a JWT header.
+        assert!(Config::extract_jwt("aaa.bbb.ccc\n").is_none());
+    }
+
+    #[test]
+    fn is_jwt_requires_an_alg_in_the_header() {
+        let payload = b64(&serde_json::json!({"organizationId": "org-1"}));
+        let headerless = b64(&serde_json::json!({"typ": "JWT"}));
+        assert!(!Config::is_jwt(&format!("{headerless}.{payload}.sig")));
+
+        let header = b64(&serde_json::json!({"alg": "HS256", "typ": "JWT"}));
+        assert!(Config::is_jwt(&format!("{header}.{payload}.sig")));
     }
 
     #[test]

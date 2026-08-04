@@ -9,4 +9,9 @@ if ! cargo fmt --check; then
 fi
 
 echo "pre-commit: running clippy..."
-cargo clippy -- -D warnings
+cargo clippy --all-targets -- -D warnings
+
+# The hook used to stop before the tests, so it passed on commits `just check`
+# would have rejected.
+echo "pre-commit: running tests..."
+cargo test

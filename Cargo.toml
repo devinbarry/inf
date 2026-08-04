@@ -1,13 +1,16 @@
-# The project, repo and binary are all `inf`. Only the crates.io package name
-# differs: `inf` is already taken there by an unrelated crate, so the package
-# publishes as `ifp` while the binary installed on PATH stays `inf`.
+# The project, repo and binary are all `inf`. Only the package name differs:
+# `inf` is already taken on crates.io by an unrelated crate, so the package is
+# named `ifp` while the binary installed on PATH stays `inf`.
+#
+# `publish = false` because it is not on crates.io today; `cargo install --path .`
+# is unaffected. Drop that line if the `ifp` name is ever claimed and published.
 [package]
 name = "ifp"
 version = "0.1.0"
 edition = "2021"
 description = "Infisical control-plane CLI - manage projects, environments and machine identities"
 license = "MIT"
-repository = "https://github.com/devinbarry/inf"
+repository = "https://example.invalid/tools/inf"
 publish = false
 
 [[bin]]
@@ -24,11 +27,11 @@ thiserror = "2"
 colored = "2"
 dirs = "5"
 base64 = "0.22"
+unicode-width = "0.2.2"
 
 [dev-dependencies]
-serial_test = "3"
 mockito = "1"
-tempfile = "3"
+tempfile = "3"    # tests/cli.rs writes a fake `infisical` shim onto the child's PATH
 
 [dev-dependencies.cargo-husky]
 version = "1"

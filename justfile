@@ -7,8 +7,12 @@ release-prep level:
     #!/usr/bin/env bash
     set -euo pipefail
 
-    # Bump version in Cargo.toml (dry-run to get new version, then sed)
-    OLD_VERSION=$(cargo metadata --no-deps --format-version 1 | python3 -c "import sys,json; print(json.load(sys.stdin)['packages'][0]['version'])")
+    # Read the version straight out of Cargo.toml. Parsing `cargo metadata`
+    # needed python3, an undeclared dependency in a Rust project.
+    OLD_VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+    if [[ -z "$OLD_VERSION" ]]; then
+        echo "Error: could not read version from Cargo.toml"; exit 1
+    fi
     echo "Current version: $OLD_VERSION"
 
     # Calculate new version
@@ -28,7 +32,9 @@ release-prep level:
     else
         sed -i "s/^version = \"$OLD_VERSION\"/version = \"$NEW_VERSION\"/" Cargo.toml
     fi
-    cargo check --quiet 2>/dev/null  # update Cargo.lock
+    # Update Cargo.lock. Errors are shown: suppressing them left a half-bumped
+    # Cargo.toml and no explanation of why the recipe stopped.
+    cargo check --quiet
 
     # Generate changelog draft to stdout for reference
     echo ""
@@ -48,18 +54,42 @@ release-finish:
     #!/usr/bin/env bash
     set -euo pipefail
 
-    VERSION=$(cargo metadata --no-deps --format-version 1 | python3 -c "import sys,json; print(json.load(sys.stdin)['packages'][0]['version'])")
+    VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
     echo "Releasing v${VERSION}"
 
-    # Verify there are staged or unstaged changes to commit
-    if git diff --quiet && git diff --cached --quiet; then
-        echo "Error: no changes to commit. Did you run 'just release-prep' and edit CHANGELOG.md?"
+    # Check what the old guard only claimed to check. `release-prep` always
+    # dirties Cargo.toml, so "are there changes?" was satisfied by the version
+    # bump alone and would happily tag an unedited changelog.
+    if ! grep -q "^## \[${VERSION}\]" CHANGELOG.md; then
+        echo "Error: CHANGELOG.md has no '## [${VERSION}]' section."
+        echo "Run 'just release-prep' and write the release notes first."
         exit 1
     fi
 
-    # Commit, tag, push, install
+    # Fail before creating a tag that cannot be pushed.
+    if ! git remote get-url origin >/dev/null 2>&1; then
+        echo "Error: no 'origin' remote configured; nothing to push to."
+        exit 1
+    fi
+
+    # Refuse to release something that does not pass its own checks.
+    just check
+
+    # Refuse to tag a version that is already tagged.
+    if git rev-parse -q --verify "refs/tags/v${VERSION}" >/dev/null; then
+        echo "Error: tag v${VERSION} already exists. Bump the version first."
+        exit 1
+    fi
+
+    # Commit, tag, push, install. The release commit is skipped when there is
+    # nothing to put in it — the case for an initial release, where the version
+    # in Cargo.toml is already correct and `release-prep` never ran.
     git add Cargo.toml Cargo.lock CHANGELOG.md
-    git commit -m "chore: release v${VERSION}"
+    if git diff --cached --quiet; then
+        echo "No release-only changes to commit; tagging the current HEAD."
+    else
+        git commit -m "chore: release v${VERSION}"
+    fi
     git tag -a "v${VERSION}" -m "v${VERSION}"
     git push && git push --tags
     cargo install --path . --force
@@ -72,7 +102,7 @@ test:
 
 # Run clippy
 lint:
-    cargo clippy -- -D warnings
+    cargo clippy --all-targets -- -D warnings
 
 # Format code
 fmt:
@@ -81,7 +111,7 @@ fmt:
 # Run all CI checks locally (fmt, clippy, test)
 check:
     cargo fmt --check
-    cargo clippy -- -D warnings
+    cargo clippy --all-targets -- -D warnings
     cargo test
 
 # Install binary to ~/.cargo/bin (cargo default)

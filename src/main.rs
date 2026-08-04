@@ -11,14 +11,18 @@ use client::InfisicalClient;
 use colored::Colorize;
 use config::Config;
 use error::Result;
+use output::Format;
 
 #[derive(Parser)]
 #[command(
     name = "inf",
     version,
-    about = "Infisical control-plane CLI - projects, environments and machine identities",
+    about = "Infisical control-plane CLI for agents - projects, environments and machine identities",
     long_about = "inf manages the Infisical resources the official `infisical` CLI cannot: \
                   projects, environments and machine identities.\n\n\
+                  It is built to be driven by agents and scripts: every command writes JSON \
+                  to stdout and nothing else, and errors are JSON on stderr. Pass --human for \
+                  tables and colour when a person is reading.\n\n\
                   It reuses the session established by `infisical login`, so no separate \
                   credentials are needed. Secret read/write stays with the official CLI."
 )]
@@ -28,6 +32,11 @@ struct Cli {
     #[arg(long, global = true)]
     domain: Option<String>,
 
+    /// Render tables and status lines for a human reader instead of JSON.
+    /// Output is JSON unless this is passed.
+    #[arg(long, global = true)]
+    human: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -35,10 +44,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Show the active session: instance, organization and expiry
-    Whoami {
-        #[arg(long)]
-        json: bool,
-    },
+    Whoami,
     /// Manage projects and their environments
     #[command(subcommand)]
     Project(ProjectCommands),
@@ -51,33 +57,28 @@ enum Commands {
 enum ProjectCommands {
     /// List projects
     #[command(visible_alias = "list")]
-    Ls {
-        #[arg(long)]
-        json: bool,
-    },
+    Ls,
     /// Show one project and its environments
     Get {
         /// Project id, slug, name, or a unique substring
         query: String,
-        #[arg(long)]
-        json: bool,
     },
     /// Create a project
     Create {
         /// Project name
         #[arg(long)]
         name: String,
-        /// URL-safe slug. Derived from the name when omitted.
+        /// URL-safe slug. The server generates one from the name — with a
+        /// random suffix — when this is omitted.
         #[arg(long)]
         slug: Option<String>,
         #[arg(long)]
         description: Option<String>,
-        /// Product this project belongs to
+        /// Product this project belongs to. `ssh` and `ai` were removed in
+        /// Infisical v0.162.16 and are rejected by servers at or above it.
         #[arg(long, default_value = "secret-manager",
               value_parser = ["secret-manager", "cert-manager", "kms", "ssh", "secret-scanning", "pam", "ai"])]
         r#type: String,
-        #[arg(long)]
-        json: bool,
     },
     /// Rename a project
     Rename {
@@ -85,8 +86,6 @@ enum ProjectCommands {
         query: String,
         /// New name
         new_name: String,
-        #[arg(long)]
-        json: bool,
     },
     /// Update project fields
     Update {
@@ -105,15 +104,13 @@ enum ProjectCommands {
         /// Allow deletion
         #[arg(long)]
         no_delete_protection: bool,
-        #[arg(long)]
-        json: bool,
     },
     /// Delete a project and every secret in it
     #[command(visible_alias = "rm")]
     Delete {
         /// Project id, slug, name, or a unique substring
         query: String,
-        /// Skip the confirmation prompt
+        /// Proceed without confirmation. Required outside --human.
         #[arg(long, short = 'y')]
         yes: bool,
     },
@@ -121,8 +118,6 @@ enum ProjectCommands {
     Identities {
         /// Project id, slug, name, or a unique substring
         query: String,
-        #[arg(long)]
-        json: bool,
     },
     /// Manage environments within a project
     #[command(subcommand)]
@@ -136,8 +131,6 @@ enum EnvCommands {
     Ls {
         /// Project id, slug, name, or a unique substring
         project: String,
-        #[arg(long)]
-        json: bool,
     },
     /// Create an environment
     Create {
@@ -149,8 +142,6 @@ enum EnvCommands {
         /// Slug used in secret paths. Derived from the name when omitted.
         #[arg(long)]
         slug: Option<String>,
-        #[arg(long)]
-        json: bool,
     },
     /// Rename an environment or change its slug
     Update {
@@ -162,8 +153,6 @@ enum EnvCommands {
         name: Option<String>,
         #[arg(long)]
         slug: Option<String>,
-        #[arg(long)]
-        json: bool,
     },
     /// Delete an environment and its secrets
     #[command(visible_alias = "rm")]
@@ -172,6 +161,7 @@ enum EnvCommands {
         project: String,
         /// Environment slug, id or name
         env: String,
+        /// Proceed without confirmation. Required outside --human.
         #[arg(long, short = 'y')]
         yes: bool,
     },
@@ -189,8 +179,6 @@ enum IdentityCommands {
         /// Project id, slug, name, or a unique substring
         #[arg(long)]
         project: Option<String>,
-        #[arg(long)]
-        json: bool,
     },
     /// Show one identity
     Get {
@@ -199,8 +187,6 @@ enum IdentityCommands {
         /// Project the identity is scoped to
         #[arg(long)]
         project: Option<String>,
-        #[arg(long)]
-        json: bool,
     },
     /// Create a machine identity scoped to a single project
     ///
@@ -215,15 +201,14 @@ enum IdentityCommands {
         /// substring.
         #[arg(long)]
         project: String,
-        /// Project role. Defaults to read-only.
+        /// Project role. Defaults to read-only. Custom role slugs are accepted,
+        /// so this is validated by the server rather than here.
         #[arg(long, default_value = "viewer")]
         role: String,
         /// Also attach Universal Auth and mint a client secret, so the
         /// identity is immediately usable
         #[arg(long)]
         with_universal_auth: bool,
-        #[arg(long)]
-        json: bool,
     },
     /// Rename an identity
     Rename {
@@ -234,8 +219,6 @@ enum IdentityCommands {
         /// Project the identity is scoped to
         #[arg(long)]
         project: Option<String>,
-        #[arg(long)]
-        json: bool,
     },
     /// Change an identity's role within its project
     SetRole {
@@ -247,8 +230,6 @@ enum IdentityCommands {
         /// Project role. Defaults to read-only.
         #[arg(long, default_value = "viewer")]
         role: String,
-        #[arg(long)]
-        json: bool,
     },
     /// Delete an identity
     #[command(visible_alias = "rm")]
@@ -258,6 +239,7 @@ enum IdentityCommands {
         /// Project the identity is scoped to
         #[arg(long)]
         project: Option<String>,
+        /// Proceed without confirmation. Required outside --human.
         #[arg(long, short = 'y')]
         yes: bool,
     },
@@ -276,45 +258,53 @@ enum IdentityCommands {
         /// Maximum number of uses; 0 means unlimited
         #[arg(long, default_value_t = 0)]
         num_uses: i64,
-        #[arg(long)]
-        json: bool,
     },
 }
 
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
+    let format = Format::new(cli.human);
+
     if let Err(err) = run(cli).await {
-        eprintln!("{} {err}", "error:".red().bold());
+        // stdout stays reserved for the result, so failures go to stderr — as
+        // JSON by default, because the caller is normally a program that has to
+        // branch on the failure rather than read it.
+        if format.is_human() {
+            eprintln!("{} {err}", "error:".red().bold());
+        } else {
+            eprintln!(
+                "{}",
+                serde_json::to_string_pretty(&err.to_json()).unwrap_or_default()
+            );
+        }
         std::process::exit(err.exit_code());
     }
 }
 
 async fn run(cli: Cli) -> Result<()> {
+    let format = Format::new(cli.human);
     let config = Config::load(cli.domain.as_deref())?;
 
     // whoami is answered entirely from the decoded session, so it stays useful
     // when the API is unreachable.
-    if let Commands::Whoami { json } = &cli.command {
-        return whoami(&config, *json);
+    if let Commands::Whoami = &cli.command {
+        return whoami(&config, format);
     }
 
     let client = InfisicalClient::new(config);
 
     match cli.command {
-        Commands::Whoami { .. } => unreachable!("handled above"),
+        Commands::Whoami => unreachable!("handled above"),
 
         Commands::Project(command) => match command {
-            ProjectCommands::Ls { json } => commands::project::list(&client, json).await,
-            ProjectCommands::Get { query, json } => {
-                commands::project::get(&client, &query, json).await
-            }
+            ProjectCommands::Ls => commands::project::list(&client, format).await,
+            ProjectCommands::Get { query } => commands::project::get(&client, &query, format).await,
             ProjectCommands::Create {
                 name,
                 slug,
                 description,
                 r#type,
-                json,
             } => {
                 commands::project::create(
                     &client,
@@ -322,15 +312,13 @@ async fn run(cli: Cli) -> Result<()> {
                     slug.as_deref(),
                     description.as_deref(),
                     &r#type,
-                    json,
+                    format,
                 )
                 .await
             }
-            ProjectCommands::Rename {
-                query,
-                new_name,
-                json,
-            } => commands::project::rename(&client, &query, &new_name, json).await,
+            ProjectCommands::Rename { query, new_name } => {
+                commands::project::rename(&client, &query, &new_name, format).await
+            }
             ProjectCommands::Update {
                 query,
                 name,
@@ -338,7 +326,6 @@ async fn run(cli: Cli) -> Result<()> {
                 description,
                 delete_protection,
                 no_delete_protection,
-                json,
             } => {
                 // Two flags model one tri-state: set, cleared, or untouched.
                 let protection = match (delete_protection, no_delete_protection) {
@@ -353,27 +340,26 @@ async fn run(cli: Cli) -> Result<()> {
                     slug.as_deref(),
                     description.as_deref(),
                     protection,
-                    json,
+                    format,
                 )
                 .await
             }
             ProjectCommands::Delete { query, yes } => {
-                commands::project::delete(&client, &query, yes).await
+                commands::project::delete(&client, &query, yes, format).await
             }
-            ProjectCommands::Identities { query, json } => {
-                commands::project::identities(&client, &query, json).await
+            ProjectCommands::Identities { query } => {
+                commands::project::identities(&client, &query, format).await
             }
             ProjectCommands::Env(command) => match command {
-                EnvCommands::Ls { project, json } => {
-                    commands::project::env_list(&client, &project, json).await
+                EnvCommands::Ls { project } => {
+                    commands::project::env_list(&client, &project, format).await
                 }
                 EnvCommands::Create {
                     project,
                     name,
                     slug,
-                    json,
                 } => {
-                    commands::project::env_create(&client, &project, &name, slug.as_deref(), json)
+                    commands::project::env_create(&client, &project, &name, slug.as_deref(), format)
                         .await
                 }
                 EnvCommands::Update {
@@ -381,7 +367,6 @@ async fn run(cli: Cli) -> Result<()> {
                     env,
                     name,
                     slug,
-                    json,
                 } => {
                     commands::project::env_update(
                         &client,
@@ -389,31 +374,28 @@ async fn run(cli: Cli) -> Result<()> {
                         &env,
                         name.as_deref(),
                         slug.as_deref(),
-                        json,
+                        format,
                     )
                     .await
                 }
                 EnvCommands::Delete { project, env, yes } => {
-                    commands::project::env_delete(&client, &project, &env, yes).await
+                    commands::project::env_delete(&client, &project, &env, yes, format).await
                 }
             },
         },
 
         Commands::Identity(command) => match command {
-            IdentityCommands::Ls { project, json } => {
-                commands::identity::list(&client, project.as_deref(), json).await
+            IdentityCommands::Ls { project } => {
+                commands::identity::list(&client, project.as_deref(), format).await
             }
-            IdentityCommands::Get {
-                query,
-                project,
-                json,
-            } => commands::identity::get(&client, &query, project.as_deref(), json).await,
+            IdentityCommands::Get { query, project } => {
+                commands::identity::get(&client, &query, project.as_deref(), format).await
+            }
             IdentityCommands::Create {
                 name,
                 project,
                 role,
                 with_universal_auth,
-                json,
             } => {
                 commands::identity::create(
                     &client,
@@ -421,7 +403,7 @@ async fn run(cli: Cli) -> Result<()> {
                     &project,
                     &role,
                     with_universal_auth,
-                    json,
+                    format,
                 )
                 .await
             }
@@ -429,29 +411,26 @@ async fn run(cli: Cli) -> Result<()> {
                 query,
                 new_name,
                 project,
-                json,
             } => {
-                commands::identity::rename(&client, &query, &new_name, project.as_deref(), json)
+                commands::identity::rename(&client, &query, &new_name, project.as_deref(), format)
                     .await
             }
             IdentityCommands::SetRole {
                 query,
                 project,
                 role,
-                json,
-            } => commands::identity::set_role(&client, &query, &project, &role, json).await,
+            } => commands::identity::set_role(&client, &query, &project, &role, format).await,
             IdentityCommands::Delete {
                 query,
                 project,
                 yes,
-            } => commands::identity::delete(&client, &query, project.as_deref(), yes).await,
+            } => commands::identity::delete(&client, &query, project.as_deref(), yes, format).await,
             IdentityCommands::ClientSecret {
                 query,
                 project,
                 description,
                 ttl,
                 num_uses,
-                json,
             } => {
                 commands::identity::client_secret(
                     &client,
@@ -460,7 +439,7 @@ async fn run(cli: Cli) -> Result<()> {
                     &description,
                     ttl,
                     num_uses,
-                    json,
+                    format,
                 )
                 .await
             }
@@ -468,28 +447,326 @@ async fn run(cli: Cli) -> Result<()> {
     }
 }
 
-fn whoami(config: &Config, json: bool) -> Result<()> {
+fn whoami(config: &Config, format: Format) -> Result<()> {
     let days = config.days_until_expiry();
 
-    if json {
-        output::json(&serde_json::json!({
+    output::emit(
+        format,
+        &serde_json::json!({
             "domain": config.api_url,
             "organizationId": config.org_id,
             "expiresAt": config.expires_at,
             "daysUntilExpiry": days,
-        }));
-        return Ok(());
-    }
-
-    println!("{} {}", "Instance:".bold(), config.api_url);
-    println!("{} {}", "Organization:".bold(), config.org_id);
-    match days {
-        Some(days) if days <= 1 => {
-            println!("{} {}", "Session:".bold(), "expires within a day".yellow());
-            output::warn("run `infisical login` soon; the CLI cannot refresh this session");
-        }
-        Some(days) => println!("{} valid for {} more days", "Session:".bold(), days),
-        None => println!("{} valid", "Session:".bold()),
+        }),
+        || {
+            println!("{} {}", "Instance:".bold(), config.api_url);
+            println!("{} {}", "Organization:".bold(), config.org_id);
+            match days {
+                Some(days) if days <= 1 => {
+                    println!("{} {}", "Session:".bold(), "expires within a day".yellow());
+                }
+                Some(days) => println!("{} valid for {} more days", "Session:".bold(), days),
+                None => println!("{} valid", "Session:".bold()),
+            }
+        },
+    );
+    if matches!(days, Some(days) if days <= 1) {
+        output::warn(
+            format,
+            "run `infisical login` soon; the CLI cannot refresh this session",
+        );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// clap's own consistency checks: duplicate flags, bad `conflicts_with`
+    /// targets, and ids that do not exist all surface here rather than at
+    /// runtime.
+    #[test]
+    fn cli_definition_is_internally_consistent() {
+        Cli::command().debug_assert();
+    }
+
+    fn parse(args: &[&str]) -> std::result::Result<Cli, clap::Error> {
+        Cli::try_parse_from(args)
+    }
+
+    fn parses(args: &[&str]) -> Cli {
+        parse(args).unwrap_or_else(|e| panic!("failed to parse {args:?}: {e}"))
+    }
+
+    /// Every invocation documented in README.md. These exist so the CLI surface
+    /// can be verified offline — checking it by running the binary means
+    /// mutating whatever instance the caller happens to be logged into.
+    #[test]
+    fn documented_invocations_parse() {
+        for args in [
+            vec!["inf", "whoami"],
+            vec!["inf", "project", "ls"],
+            vec!["inf", "project", "get", "billing"],
+            vec![
+                "inf",
+                "project",
+                "create",
+                "--name",
+                "Billing API",
+                "--description",
+                "invoicing",
+            ],
+            vec!["inf", "project", "rename", "billing", "Payments API"],
+            vec![
+                "inf",
+                "project",
+                "update",
+                "billing",
+                "--slug",
+                "payments-api",
+            ],
+            vec!["inf", "project", "delete", "billing", "--yes"],
+            vec!["inf", "project", "identities", "billing"],
+            vec!["inf", "project", "env", "ls", "billing"],
+            vec![
+                "inf", "project", "env", "create", "billing", "--name", "QA (EU)",
+            ],
+            vec![
+                "inf",
+                "project",
+                "env",
+                "update",
+                "billing",
+                "qa-eu",
+                "--name",
+                "QA Europe",
+            ],
+            vec![
+                "inf", "project", "env", "delete", "billing", "qa-eu", "--yes",
+            ],
+            vec![
+                "inf",
+                "identity",
+                "create",
+                "--name",
+                "ci-reader",
+                "--project",
+                "billing",
+                "--with-universal-auth",
+            ],
+            vec!["inf", "identity", "ls", "--project", "billing"],
+            vec![
+                "inf",
+                "identity",
+                "get",
+                "ci-reader",
+                "--project",
+                "billing",
+            ],
+            vec![
+                "inf",
+                "identity",
+                "set-role",
+                "ci-reader",
+                "--project",
+                "billing",
+                "--role",
+                "viewer",
+            ],
+            vec![
+                "inf",
+                "identity",
+                "rename",
+                "ci-reader",
+                "billing-reader",
+                "--project",
+                "billing",
+            ],
+            vec![
+                "inf",
+                "identity",
+                "client-secret",
+                "ci-reader",
+                "--project",
+                "billing",
+                "--ttl",
+                "3600",
+            ],
+            vec![
+                "inf",
+                "identity",
+                "delete",
+                "ci-reader",
+                "--project",
+                "billing",
+                "--yes",
+            ],
+        ] {
+            parses(&args);
+        }
+    }
+
+    #[test]
+    fn documented_aliases_parse() {
+        for args in [
+            vec!["inf", "project", "list"],
+            vec!["inf", "project", "rm", "billing", "--yes"],
+            vec!["inf", "id", "list"],
+            vec!["inf", "identity", "rm", "ci", "--yes"],
+            vec!["inf", "project", "env", "rm", "billing", "dev", "--yes"],
+        ] {
+            parses(&args);
+        }
+    }
+
+    #[test]
+    fn json_is_the_default_and_human_is_opt_in() {
+        assert!(!parses(&["inf", "project", "ls"]).human);
+        assert!(parses(&["inf", "--human", "project", "ls"]).human);
+        // Global, so it is accepted after the subcommand too.
+        assert!(parses(&["inf", "project", "ls", "--human"]).human);
+    }
+
+    #[test]
+    fn there_is_no_json_flag_because_json_is_the_default() {
+        assert!(parse(&["inf", "project", "ls", "--json"]).is_err());
+        assert!(parse(&["inf", "identity", "get", "ci", "--json"]).is_err());
+    }
+
+    #[test]
+    fn domain_is_global() {
+        let cli = parses(&["inf", "project", "ls", "--domain", "https://ex.com"]);
+        assert_eq!(cli.domain.as_deref(), Some("https://ex.com"));
+    }
+
+    #[test]
+    fn delete_protection_flags_conflict() {
+        // The pair models one tri-state; accepting both would silently pick one.
+        assert!(parse(&[
+            "inf",
+            "project",
+            "update",
+            "billing",
+            "--delete-protection",
+            "--no-delete-protection",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn documented_defaults_hold() {
+        let cli = parses(&[
+            "inf",
+            "identity",
+            "create",
+            "--name",
+            "ci",
+            "--project",
+            "p",
+        ]);
+        match cli.command {
+            Commands::Identity(IdentityCommands::Create {
+                role,
+                with_universal_auth,
+                ..
+            }) => {
+                assert_eq!(role, "viewer", "identities must default to read-only");
+                assert!(!with_universal_auth);
+            }
+            _ => panic!("wrong subcommand"),
+        }
+
+        let cli = parses(&["inf", "project", "create", "--name", "p"]);
+        match cli.command {
+            Commands::Project(ProjectCommands::Create { r#type, slug, .. }) => {
+                assert_eq!(r#type, "secret-manager");
+                assert!(slug.is_none());
+            }
+            _ => panic!("wrong subcommand"),
+        }
+
+        let cli = parses(&["inf", "identity", "client-secret", "ci"]);
+        match cli.command {
+            Commands::Identity(IdentityCommands::ClientSecret {
+                description,
+                ttl,
+                num_uses,
+                ..
+            }) => {
+                assert_eq!(description, "created by inf");
+                assert_eq!(ttl, 0);
+                assert_eq!(num_uses, 0);
+            }
+            _ => panic!("wrong subcommand"),
+        }
+    }
+
+    #[test]
+    fn project_is_required_only_where_documented() {
+        // Required: create and set-role. Optional everywhere else, because
+        // pre-existing org-level identities must stay manageable.
+        assert!(parse(&["inf", "identity", "create", "--name", "ci"]).is_err());
+        assert!(parse(&["inf", "identity", "set-role", "ci"]).is_err());
+
+        for args in [
+            vec!["inf", "identity", "ls"],
+            vec!["inf", "identity", "get", "ci"],
+            vec!["inf", "identity", "rename", "ci", "ci2"],
+            vec!["inf", "identity", "delete", "ci", "--yes"],
+            vec!["inf", "identity", "client-secret", "ci"],
+        ] {
+            parses(&args);
+        }
+    }
+
+    #[test]
+    fn positional_order_is_query_then_new_name() {
+        let cli = parses(&["inf", "identity", "rename", "old", "new", "--project", "p"]);
+        match cli.command {
+            Commands::Identity(IdentityCommands::Rename {
+                query,
+                new_name,
+                project,
+            }) => {
+                assert_eq!(query, "old");
+                assert_eq!(new_name, "new");
+                assert_eq!(project.as_deref(), Some("p"));
+            }
+            _ => panic!("wrong subcommand"),
+        }
+
+        let cli = parses(&["inf", "project", "rename", "old", "New Name"]);
+        match cli.command {
+            Commands::Project(ProjectCommands::Rename { query, new_name }) => {
+                assert_eq!(query, "old");
+                assert_eq!(new_name, "New Name");
+            }
+            _ => panic!("wrong subcommand"),
+        }
+    }
+
+    #[test]
+    fn documented_project_types_are_accepted_and_others_rejected() {
+        for kind in [
+            "secret-manager",
+            "cert-manager",
+            "kms",
+            "ssh",
+            "secret-scanning",
+            "pam",
+            "ai",
+        ] {
+            parses(&["inf", "project", "create", "--name", "p", "--type", kind]);
+        }
+        assert!(parse(&["inf", "project", "create", "--name", "p", "--type", "nope"]).is_err());
+    }
+
+    #[test]
+    fn short_yes_flag_is_accepted_on_every_destructive_command() {
+        parses(&["inf", "project", "delete", "p", "-y"]);
+        parses(&["inf", "project", "env", "delete", "p", "dev", "-y"]);
+        parses(&["inf", "identity", "delete", "i", "-y"]);
+    }
 }

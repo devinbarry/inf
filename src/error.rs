@@ -1,9 +1,46 @@
+use serde::Serialize;
 use thiserror::Error;
+
+/// One entry in an ambiguous-match error. Kept structured rather than
+/// pre-formatted so the JSON error payload can carry real fields — an agent
+/// disambiguating a query needs the id, not a rendered line it has to re-parse.
+#[derive(Debug, Clone, Serialize)]
+pub struct Candidate {
+    pub name: String,
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slug: Option<String>,
+}
+
+impl std::fmt::Display for Candidate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.slug {
+            Some(slug) => write!(f, "  {} ({})", self.name, slug),
+            None => write!(f, "  {} ({})", self.name, self.id),
+        }
+    }
+}
+
+fn render(candidates: &[Candidate]) -> String {
+    candidates
+        .iter()
+        .map(|c| c.to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
 #[derive(Error, Debug)]
 pub enum IfpError {
     #[error("API error: {0}")]
     Api(String),
+
+    /// A 404 from the API. Kept distinct from `Api` because "this resource does
+    /// not exist yet" is a normal, recoverable condition for some callers —
+    /// notably `identity client-secret`, which attaches Universal Auth when the
+    /// lookup misses. Folding it into `Api` made every other failure, including
+    /// an expired session, look like an absent resource.
+    #[error("Not found: {0}")]
+    NotFound(String),
 
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
@@ -19,6 +56,12 @@ pub enum IfpError {
     #[error("Not logged in. Run `infisical login`")]
     NotLoggedIn,
 
+    /// The CLI ran and failed for a reason that is not "no session" — a locked
+    /// keyring, an unreadable config file. Carrying its stderr keeps the user
+    /// from being sent to `infisical login` for a problem login will not fix.
+    #[error("`infisical` CLI failed: {0}")]
+    CliFailed(String),
+
     /// The CLI stores a refresh token but never uses it, so an expired session is
     /// terminal until the user logs in again. Say so plainly rather than letting
     /// the API return an opaque 401.
@@ -33,21 +76,63 @@ pub enum IfpError {
     #[error("No match: {0}")]
     NoMatch(String),
 
-    #[error("Ambiguous match '{query}', candidates:\n{candidates}")]
-    AmbiguousMatch { query: String, candidates: String },
+    #[error("Ambiguous match '{query}', candidates:\n{}", render(.candidates))]
+    AmbiguousMatch {
+        query: String,
+        candidates: Vec<Candidate>,
+    },
 
     #[error("Aborted")]
     Aborted,
 }
 
 impl IfpError {
-    /// Exit code: 1 for an authenticated request the server refused, 2 for
-    /// CLI/usage/config problems. Mirrors the convention used by pfp.
+    /// Exit code: 1 when the request itself failed — the server refused it or
+    /// it could not be completed — and 2 when the invocation was wrong and the
+    /// user must change something locally. A connection failure belongs in the
+    /// first group: nothing about the command line would have fixed it.
     pub fn exit_code(&self) -> i32 {
         match self {
-            IfpError::Api(_) | IfpError::Forbidden(_) => 1,
+            IfpError::Api(_)
+            | IfpError::NotFound(_)
+            | IfpError::Forbidden(_)
+            | IfpError::Http(_) => 1,
             _ => 2,
         }
+    }
+
+    /// Stable machine-readable discriminant. `inf` is driven by agents, so the
+    /// failure mode has to be matchable without regexing prose that is free to
+    /// be reworded.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            IfpError::Api(_) => "api_error",
+            IfpError::NotFound(_) => "not_found",
+            IfpError::Http(_) => "http_error",
+            IfpError::Config(_) => "config_error",
+            IfpError::CliNotFound => "cli_not_found",
+            IfpError::NotLoggedIn => "not_logged_in",
+            IfpError::CliFailed(_) => "cli_failed",
+            IfpError::TokenExpired(_) => "token_expired",
+            IfpError::Forbidden(_) => "forbidden",
+            IfpError::NoMatch(_) => "no_match",
+            IfpError::AmbiguousMatch { .. } => "ambiguous_match",
+            IfpError::Aborted => "aborted",
+        }
+    }
+
+    /// The error as the JSON object written to stderr in the default mode.
+    pub fn to_json(&self) -> serde_json::Value {
+        let mut value = serde_json::json!({
+            "error": self.kind(),
+            "message": self.to_string(),
+            "exitCode": self.exit_code(),
+        });
+        if let IfpError::AmbiguousMatch { query, candidates } = self {
+            value["query"] = serde_json::json!(query);
+            value["candidates"] = serde_json::json!(candidates);
+        }
+        value
     }
 }
 
@@ -57,10 +142,19 @@ pub type Result<T> = std::result::Result<T, IfpError>;
 mod tests {
     use super::*;
 
+    fn candidate(name: &str, id: &str, slug: Option<&str>) -> Candidate {
+        Candidate {
+            name: name.into(),
+            id: id.into(),
+            slug: slug.map(str::to_string),
+        }
+    }
+
     #[test]
-    fn api_errors_exit_one() {
+    fn request_failures_exit_one() {
         assert_eq!(IfpError::Api("500".into()).exit_code(), 1);
         assert_eq!(IfpError::Forbidden("nope".into()).exit_code(), 1);
+        assert_eq!(IfpError::NotFound("gone".into()).exit_code(), 1);
     }
 
     #[test]
@@ -69,6 +163,7 @@ mod tests {
         assert_eq!(IfpError::CliNotFound.exit_code(), 2);
         assert_eq!(IfpError::NoMatch("x".into()).exit_code(), 2);
         assert_eq!(IfpError::Config("bad".into()).exit_code(), 2);
+        assert_eq!(IfpError::Aborted.exit_code(), 2);
     }
 
     #[test]
@@ -77,6 +172,15 @@ mod tests {
             IfpError::NotLoggedIn.to_string(),
             "Not logged in. Run `infisical login`"
         );
+    }
+
+    #[test]
+    fn cli_failure_is_distinct_from_not_logged_in() {
+        // A locked keyring is not a missing session; sending the user to
+        // `infisical login` would not fix it.
+        let err = IfpError::CliFailed("keyring is locked".into());
+        assert_eq!(err.kind(), "cli_failed");
+        assert!(err.to_string().contains("keyring is locked"));
     }
 
     #[test]
@@ -91,11 +195,68 @@ mod tests {
     fn ambiguous_match_lists_candidates() {
         let err = IfpError::AmbiguousMatch {
             query: "bill".into(),
-            candidates: "  billing-api\n  billing-web".into(),
+            candidates: vec![
+                candidate("Billing API", "p1", Some("billing-api")),
+                candidate("Billing Web", "p2", Some("billing-web")),
+            ],
         };
         let msg = err.to_string();
         assert!(msg.contains("bill"));
         assert!(msg.contains("billing-api"));
         assert!(msg.contains("billing-web"));
+    }
+
+    #[test]
+    fn every_kind_is_a_stable_slug() {
+        // Agents match on `kind`, so it must never be prose.
+        for err in [
+            IfpError::Api("x".into()),
+            IfpError::NotFound("x".into()),
+            IfpError::Config("x".into()),
+            IfpError::CliNotFound,
+            IfpError::NotLoggedIn,
+            IfpError::CliFailed("x".into()),
+            IfpError::TokenExpired("x".into()),
+            IfpError::Forbidden("x".into()),
+            IfpError::NoMatch("x".into()),
+            IfpError::Aborted,
+        ] {
+            let kind = err.kind();
+            assert!(!kind.is_empty());
+            assert!(
+                kind.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+                "kind '{kind}' is not a stable slug"
+            );
+        }
+    }
+
+    #[test]
+    fn json_error_carries_kind_message_and_exit_code() {
+        let json = IfpError::Forbidden("nope".into()).to_json();
+        assert_eq!(json["error"], "forbidden");
+        assert_eq!(json["exitCode"], 1);
+        assert!(json["message"].as_str().unwrap().contains("nope"));
+    }
+
+    #[test]
+    fn json_error_carries_structured_candidates() {
+        // The whole point of structuring these: an agent picks a candidate by
+        // id without re-parsing a rendered line.
+        let json = IfpError::AmbiguousMatch {
+            query: "bill".into(),
+            candidates: vec![candidate("Billing API", "p1", Some("billing-api"))],
+        }
+        .to_json();
+        assert_eq!(json["error"], "ambiguous_match");
+        assert_eq!(json["query"], "bill");
+        assert_eq!(json["candidates"][0]["id"], "p1");
+        assert_eq!(json["candidates"][0]["slug"], "billing-api");
+    }
+
+    #[test]
+    fn candidate_without_slug_renders_its_id() {
+        let c = candidate("ci-deployer", "i1", None);
+        assert_eq!(c.to_string(), "  ci-deployer (i1)");
+        assert!(serde_json::to_value(&c).unwrap().get("slug").is_none());
     }
 }

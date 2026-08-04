@@ -1,62 +1,111 @@
 use crate::models::{IdentityMembership, Project};
 use colored::Colorize;
 use serde::Serialize;
+use unicode_width::UnicodeWidthStr;
+
+/// How results are rendered.
+///
+/// `inf` is an agent-facing tool: its caller is normally a script or an LLM
+/// agent piping stdout into `jq`, not a person reading a terminal. So JSON is
+/// the default and the only thing ever written to stdout in that mode — no
+/// tables, no status lines, no colour. `--human` is the explicit opt-in for
+/// interactive use.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Format {
+    Json,
+    Human,
+}
+
+impl Format {
+    pub fn new(human: bool) -> Self {
+        if human {
+            Format::Human
+        } else {
+            Format::Json
+        }
+    }
+
+    pub fn is_human(self) -> bool {
+        self == Format::Human
+    }
+}
+
+/// Write the result value to stdout as JSON. Pretty-printed: `jq` is
+/// indifferent and a human debugging a pipeline is not.
+pub fn json<T: Serialize>(value: &T) {
+    match serde_json::to_string_pretty(value) {
+        Ok(text) => println!("{text}"),
+        // stdout must stay parseable, so a serialisation failure is reported on
+        // stderr in the same shape as every other error.
+        Err(e) => eprintln!(
+            "{}",
+            serde_json::json!({
+                "error": "serialization_failed",
+                "message": e.to_string(),
+            })
+        ),
+    }
+}
+
+/// Confirmation of a mutation, in whichever shape the caller asked for. The
+/// JSON branch is what makes `--json`-less commands like `delete` scriptable.
+pub fn emit<T: Serialize>(format: Format, value: &T, human: impl FnOnce()) {
+    if format.is_human() {
+        human();
+    } else {
+        json(value);
+    }
+}
 
 /// Render an aligned table. Columns are sized to their widest cell so output
 /// stays readable when names vary wildly in length, and the trailing column is
 /// never padded so copy-paste does not pick up stray whitespace.
+///
+/// Widths are *display* widths. Byte length inflates a column for every
+/// non-ASCII cell, and character count still breaks on double-width CJK and
+/// emoji — both of which appear in real project names.
 pub fn table(headers: &[&str], rows: &[Vec<String>]) {
     if rows.is_empty() {
         println!("{}", "(none)".dimmed());
         return;
     }
 
-    let mut widths: Vec<usize> = headers.iter().map(|h| h.len()).collect();
+    let mut widths: Vec<usize> = headers.iter().map(|h| h.width()).collect();
     for row in rows {
         for (i, cell) in row.iter().enumerate() {
             if i < widths.len() {
-                widths[i] = widths[i].max(cell.len());
+                widths[i] = widths[i].max(cell.width());
             }
         }
     }
 
-    let header_line: Vec<String> = headers
-        .iter()
-        .enumerate()
-        .map(|(i, h)| pad(h, widths[i], i == headers.len() - 1))
-        .collect();
-    println!("{}", header_line.join("  ").bold());
-
+    println!("{}", render_row(headers.iter().copied(), &widths).bold());
     for row in rows {
-        let line: Vec<String> = row
-            .iter()
-            .enumerate()
-            .map(|(i, c)| pad(c, widths[i], i == row.len() - 1))
-            .collect();
-        println!("{}", line.join("  "));
+        println!("{}", render_row(row.iter().map(String::as_str), &widths));
     }
 }
 
-fn pad(value: &str, width: usize, is_last: bool) -> String {
-    if is_last {
-        value.to_string()
-    } else {
-        format!("{value:<width$}")
-    }
+/// Cells beyond the header count have no column to size against, so they are
+/// emitted unpadded rather than panicking on `widths[i]`.
+fn render_row<'a>(cells: impl Iterator<Item = &'a str>, widths: &[usize]) -> String {
+    let last = widths.len().saturating_sub(1);
+    cells
+        .enumerate()
+        .map(|(i, cell)| match widths.get(i) {
+            Some(width) if i != last => pad(cell, *width),
+            _ => cell.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("  ")
 }
 
-pub fn json<T: Serialize>(value: &T) {
-    match serde_json::to_string_pretty(value) {
-        Ok(text) => println!("{text}"),
-        Err(e) => eprintln!("{} {e}", "error serializing output:".red()),
-    }
-}
-
-pub fn json_raw(value: &serde_json::Value) {
-    println!(
-        "{}",
-        serde_json::to_string_pretty(value).unwrap_or_default()
-    );
+fn pad(value: &str, width: usize) -> String {
+    let mut padded = String::from(value);
+    padded.extend(std::iter::repeat_n(
+        ' ',
+        width.saturating_sub(value.width()),
+    ));
+    padded
 }
 
 pub fn projects_table(projects: &[Project]) {
@@ -146,12 +195,18 @@ pub fn project_detail(project: &Project) {
     table(&["NAME", "SLUG", "ID"], &rows);
 }
 
-pub fn success(message: &str) {
-    println!("{} {}", "✓".green().bold(), message);
+/// Human-mode only. In JSON mode the result object on stdout already says what
+/// happened, and a decorative line would be noise the caller has to strip.
+pub fn success(format: Format, message: &str) {
+    if format.is_human() {
+        println!("{} {}", "✓".green().bold(), message);
+    }
 }
 
-pub fn warn(message: &str) {
-    eprintln!("{} {}", "!".yellow().bold(), message);
+pub fn warn(format: Format, message: &str) {
+    if format.is_human() {
+        eprintln!("{} {}", "!".yellow().bold(), message);
+    }
 }
 
 #[cfg(test)]
@@ -181,10 +236,64 @@ mod tests {
     }
 
     #[test]
-    fn pad_fills_interior_columns_only() {
-        assert_eq!(pad("ab", 5, false), "ab   ");
-        // The final column is left unpadded so copied output has no trailing
-        // spaces.
-        assert_eq!(pad("ab", 5, true), "ab");
+    fn pad_fills_to_display_width() {
+        assert_eq!(pad("ab", 5), "ab   ");
+        assert_eq!(pad("ab", 2), "ab");
+        // Never truncates, and never underflows on an over-wide cell.
+        assert_eq!(pad("abcdef", 3), "abcdef");
+    }
+
+    #[test]
+    fn pad_counts_display_width_not_bytes() {
+        // "Café" is 5 bytes but 4 columns; padding by bytes left the column one
+        // space short of the others.
+        assert_eq!(pad("Café", 6).width(), 6);
+        // CJK is two columns per character.
+        assert_eq!(pad("生産", 6).width(), 6);
+        assert_eq!(pad("生産", 6), "生産  ");
+    }
+
+    #[test]
+    fn rows_align_across_mixed_scripts() {
+        let widths = vec![12, 4];
+        let ascii = render_row(["alpha", "a"].into_iter(), &widths);
+        let accented = render_row(["Café Billing", "b"].into_iter(), &widths);
+        let cjk = render_row(["生産システム", "c"].into_iter(), &widths);
+        // Every first column occupies the same number of terminal columns, so
+        // the second column starts at the same offset on every row.
+        for line in [&ascii, &accented, &cjk] {
+            let first = line.rsplit_once("  ").unwrap().0;
+            assert_eq!(first.width(), 12, "misaligned: {line:?}");
+        }
+    }
+
+    #[test]
+    fn last_column_is_never_padded() {
+        // Trailing whitespace would be picked up by copy-paste and by `cut`.
+        let row = render_row(["ab", "cd"].into_iter(), &[5, 5]);
+        assert_eq!(row, "ab     cd");
+        assert!(!row.ends_with(' '));
+    }
+
+    #[test]
+    fn extra_cells_do_not_panic() {
+        // Sizing skipped cells beyond the header count while rendering indexed
+        // them unguarded, so a mismatched row panicked instead of degrading.
+        let row = render_row(["a", "b", "surplus"].into_iter(), &[3, 3]);
+        assert!(row.contains("surplus"));
+    }
+
+    #[test]
+    fn short_rows_pad_against_the_header_columns() {
+        // Padding decided by `row.len()` suppressed it on the wrong column when
+        // a row was shorter than the header.
+        let row = render_row(["a"].into_iter(), &[4, 4]);
+        assert_eq!(row, "a   ");
+    }
+
+    #[test]
+    fn json_is_the_default_format() {
+        assert!(!Format::new(false).is_human());
+        assert!(Format::new(true).is_human());
     }
 }
