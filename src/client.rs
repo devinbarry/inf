@@ -5,10 +5,17 @@ use reqwest::{Method, StatusCode};
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 
-/// Identity listings are paginated and default to 20 rows — small enough that
-/// an organization of any size silently loses identities from the tail, which
-/// then resolve as "no match". 1000 is the server's maximum page size; we walk
-/// pages until one comes back short.
+/// The project-membership listing paginates and defaults to 20 rows — small
+/// enough that an organization of any size silently loses identities from the
+/// tail, which then resolve as "no match". 1000 is the server's maximum page
+/// size.
+///
+/// The org-level listing (`GET /v1/identities`) does *not* paginate: its
+/// querystring schema accepts `orgId` alone, so zod strips `limit`/`offset` and
+/// the route returns everything in one response. Both routes do return
+/// `totalCount`, so that — not a short page — is what terminates the walk. A
+/// short-page rule looked right but re-fetched the identical full response
+/// forever on any org with at least `PAGE_LIMIT` identities.
 const PAGE_LIMIT: usize = 1000;
 
 /// Backstop against a server that ignores `limit` and returns a full page
@@ -262,31 +269,46 @@ impl InfisicalClient {
 
     // -- Machine identities --
 
-    /// Walks every page. The route defaults to 20 rows and caps at 1000, so a
-    /// single unpaginated call quietly drops the 21st identity onward — and a
-    /// dropped identity resolves as "no match", not as an error.
+    /// The org listing returns every identity in one response — see the note on
+    /// [`PAGE_LIMIT`]. The walk is kept anyway so this stays correct if the
+    /// route gains pagination, but it terminates on `totalCount`.
     pub async fn list_identities(&self) -> Result<Vec<IdentityMembership>> {
         #[derive(serde::Deserialize)]
         struct Response {
             identities: Vec<IdentityMembership>,
+            #[serde(rename = "totalCount", default)]
+            total_count: Option<usize>,
         }
         let mut all = Vec::new();
-        let mut offset = 0usize;
         for _ in 0..MAX_PAGES {
             let page: Response = self
                 .get_json(&format!(
-                    "/v1/identities?orgId={}&limit={PAGE_LIMIT}&offset={offset}",
-                    self.org_id
+                    "/v1/identities?orgId={}&limit={PAGE_LIMIT}&offset={}",
+                    self.org_id,
+                    all.len()
                 ))
                 .await?;
             let count = page.identities.len();
             all.extend(page.identities);
-            if count < PAGE_LIMIT {
+            if Self::walk_is_done(count, all.len(), page.total_count) {
                 break;
             }
-            offset += count;
         }
         Ok(all)
+    }
+
+    /// Stop when the server says we have everything, when a page came back
+    /// short, or when a page was empty. `totalCount` is authoritative and is
+    /// the only rule that is correct for a non-paginating route, where every
+    /// request returns the same full set.
+    fn walk_is_done(page_count: usize, collected: usize, total: Option<usize>) -> bool {
+        if page_count == 0 {
+            return true;
+        }
+        match total {
+            Some(total) => collected >= total,
+            None => page_count < PAGE_LIMIT,
+        }
     }
 
     /// Create an identity scoped to a single project. Unlike an org identity
@@ -425,8 +447,10 @@ impl InfisicalClient {
 
     // -- Project membership for identities --
 
-    /// Paginated for the same reason as [`list_identities`]: the default page
-    /// is 20 rows.
+    /// This route genuinely paginates: `offset` and `limit` are in its
+    /// querystring schema and `limit` defaults to 20, so an unpaginated call
+    /// drops the 21st identity onward — and a dropped identity resolves as
+    /// "no match", not as an error.
     pub async fn list_project_identities(
         &self,
         project_id: &str,
@@ -435,21 +459,22 @@ impl InfisicalClient {
         struct Response {
             #[serde(rename = "identityMemberships")]
             memberships: Vec<IdentityMembership>,
+            #[serde(rename = "totalCount", default)]
+            total_count: Option<usize>,
         }
         let mut all = Vec::new();
-        let mut offset = 0usize;
         for _ in 0..MAX_PAGES {
             let page: Response = self
                 .get_json(&format!(
-                    "/v1/projects/{project_id}/memberships/identities?limit={PAGE_LIMIT}&offset={offset}"
+                    "/v1/projects/{project_id}/memberships/identities?limit={PAGE_LIMIT}&offset={}",
+                    all.len()
                 ))
                 .await?;
             let count = page.memberships.len();
             all.extend(page.memberships);
-            if count < PAGE_LIMIT {
+            if Self::walk_is_done(count, all.len(), page.total_count) {
                 break;
             }
-            offset += count;
         }
         Ok(all)
     }
@@ -592,6 +617,60 @@ mod tests {
         second.assert_async().await;
         assert_eq!(identities.len(), PAGE_LIMIT + 1);
         assert_eq!(identities.last().unwrap().name(), "last");
+    }
+
+    #[test]
+    fn walk_stops_on_total_count_even_when_the_page_is_full() {
+        // The org route ignores limit/offset and returns everything, so a full
+        // page is not evidence that more exists. Without totalCount as the
+        // authority the walk re-fetched the identical response until MAX_PAGES.
+        assert!(InfisicalClient::walk_is_done(
+            PAGE_LIMIT,
+            PAGE_LIMIT,
+            Some(PAGE_LIMIT)
+        ));
+        // Genuinely more to fetch.
+        assert!(!InfisicalClient::walk_is_done(
+            PAGE_LIMIT,
+            PAGE_LIMIT,
+            Some(PAGE_LIMIT + 5)
+        ));
+        // No totalCount: fall back to the short-page rule.
+        assert!(!InfisicalClient::walk_is_done(PAGE_LIMIT, PAGE_LIMIT, None));
+        assert!(InfisicalClient::walk_is_done(3, 3, None));
+        // An empty page always terminates, whatever totalCount claims.
+        assert!(InfisicalClient::walk_is_done(0, 5, Some(99)));
+    }
+
+    #[tokio::test]
+    async fn a_non_paginating_route_is_fetched_exactly_once() {
+        let mut server = mockito::Server::new_async().await;
+        // Exactly PAGE_LIMIT rows with a matching totalCount: the boundary case
+        // where a short-page rule loops forever and duplicates every row.
+        let rows: Vec<String> = (0..PAGE_LIMIT)
+            .map(|n| {
+                format!(
+                    r#"{{"identityId":"i{n}","identity":{{"id":"i{n}","name":"id-{n}","authMethods":[]}}}}"#
+                )
+            })
+            .collect();
+        let mock = server
+            .mock("GET", "/v1/identities")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(format!(
+                r#"{{"identities":[{}],"totalCount":{PAGE_LIMIT}}}"#,
+                rows.join(",")
+            ))
+            .expect(1)
+            .create_async()
+            .await;
+
+        let client = InfisicalClient::with_parts(&server.url(), "t", "org-1");
+        let identities = client.list_identities().await.unwrap();
+
+        mock.assert_async().await;
+        assert_eq!(identities.len(), PAGE_LIMIT, "rows must not be duplicated");
     }
 
     #[tokio::test]

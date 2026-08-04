@@ -276,7 +276,7 @@ async fn destructive_commands_refuse_without_yes_and_never_hang() {
 
     assert_eq!(output.status.code(), Some(2));
     let json = stderr_json(&output);
-    assert_eq!(json["error"], "config_error");
+    assert_eq!(json["error"], "confirmation_required");
     assert!(json["message"].as_str().unwrap().contains("--yes"));
     deleted.assert_async().await;
 }
@@ -591,6 +591,320 @@ async fn client_secret_does_not_mistake_an_expired_session_for_a_missing_method(
     assert_eq!(output.status.code(), Some(2));
     assert_eq!(stderr_json(&output)["error"], "not_logged_in");
     attach.assert_async().await;
+}
+
+#[tokio::test]
+async fn identity_get_reports_universal_auth_for_a_project_scoped_identity() {
+    let mut server = mockito::Server::new_async().await;
+    server
+        .mock("GET", "/api/v1/projects")
+        .with_status(200)
+        .with_body(TWO_PROJECTS)
+        .create_async()
+        .await;
+    // The project membership route reports authMethods: [] even when Universal
+    // Auth is attached. Gating the lookup on that field made clientId
+    // permanently null for the only kind of identity `inf` creates.
+    server
+        .mock("GET", "/api/v1/projects/p1/memberships/identities")
+        .match_query(mockito::Matcher::Any)
+        .with_status(200)
+        .with_body(
+            r#"{"identityMemberships":[{"identityId":"i1","roles":[{"role":"viewer"}],
+               "identity":{"id":"i1","name":"ci","authMethods":[]}}]}"#,
+        )
+        .create_async()
+        .await;
+    let ua = server
+        .mock("GET", "/api/v1/auth/universal-auth/identities/i1")
+        .with_status(200)
+        .with_body(r#"{"identityUniversalAuth":{"clientId":"cid-123","accessTokenTTL":2592000}}"#)
+        .expect(1)
+        .create_async()
+        .await;
+
+    let run = Run::new(&server.url());
+    let output = run.exec(&["identity", "get", "ci", "--project", "billing"]);
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    ua.assert_async().await;
+    let json = stdout_json(&output);
+    assert_eq!(json["clientId"], "cid-123");
+    assert_eq!(json["role"], "viewer");
+    assert_eq!(json["scope"], "project");
+}
+
+#[tokio::test]
+async fn identity_get_treats_a_404_as_no_universal_auth() {
+    let mut server = mockito::Server::new_async().await;
+    server
+        .mock("GET", "/api/v1/identities")
+        .match_query(mockito::Matcher::Any)
+        .with_status(200)
+        .with_body(
+            r#"{"identities":[{"identityId":"i1","role":"admin",
+               "identity":{"id":"i1","name":"ci","authMethods":[]}}],"totalCount":1}"#,
+        )
+        .create_async()
+        .await;
+    server
+        .mock("GET", "/api/v1/auth/universal-auth/identities/i1")
+        .with_status(404)
+        .with_body(r#"{"message":"not configured"}"#)
+        .create_async()
+        .await;
+
+    let run = Run::new(&server.url());
+    let output = run.exec(&["identity", "get", "ci"]);
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    let json = stdout_json(&output);
+    assert!(json["clientId"].is_null());
+    // A missing method is not an error, so no error field is reported.
+    assert!(json.get("universalAuthError").is_none());
+}
+
+#[tokio::test]
+async fn project_identities_matches_the_identity_ls_shape() {
+    let mut server = mockito::Server::new_async().await;
+    server
+        .mock("GET", "/api/v1/projects")
+        .with_status(200)
+        .with_body(TWO_PROJECTS)
+        .create_async()
+        .await;
+    server
+        .mock("GET", "/api/v1/projects/p1/memberships/identities")
+        .match_query(mockito::Matcher::Any)
+        .with_status(200)
+        .with_body(
+            r#"{"identityMemberships":[{"identityId":"i1",
+               "roles":[{"role":"admin","customRoleSlug":null}],
+               "identity":{"id":"i1","name":"ci","authMethods":[]}}]}"#,
+        )
+        .expect(2)
+        .create_async()
+        .await;
+
+    let run = Run::new(&server.url());
+    let via_project = stdout_json(&run.exec(&["project", "identities", "billing"]));
+    let via_identity = stdout_json(&run.exec(&["identity", "ls", "--project", "billing"]));
+
+    // The README invites `jq '.[] | select(.role=="admin") | .name'` on identity
+    // listings; emitting the raw membership here returned null for both fields.
+    assert_eq!(via_project[0]["role"], "admin");
+    assert_eq!(via_project[0]["name"], "ci");
+    assert_eq!(via_project[0]["id"], "i1");
+    assert_eq!(via_project, via_identity);
+}
+
+#[tokio::test]
+async fn deleting_a_project_scoped_identity_uses_the_project_route() {
+    let mut server = mockito::Server::new_async().await;
+    server
+        .mock("GET", "/api/v1/projects")
+        .with_status(200)
+        .with_body(TWO_PROJECTS)
+        .create_async()
+        .await;
+    server
+        .mock("GET", "/api/v1/projects/p1/memberships/identities")
+        .match_query(mockito::Matcher::Any)
+        .with_status(200)
+        .with_body(
+            r#"{"identityMemberships":[{"identityId":"i1","roles":[{"role":"viewer"}],
+               "identity":{"id":"i1","name":"ci","authMethods":[]}}]}"#,
+        )
+        .create_async()
+        .await;
+    // The org route rejects project-scoped identities; revocation is the
+    // documented purpose of this command, so the branch must be pinned.
+    let org_route = server
+        .mock("DELETE", "/api/v1/identities/i1")
+        .with_status(400)
+        .expect(0)
+        .create_async()
+        .await;
+    let project_route = server
+        .mock("DELETE", "/api/v1/projects/p1/identities/i1")
+        .with_status(200)
+        .with_body("")
+        .create_async()
+        .await;
+
+    let run = Run::new(&server.url());
+    let output = run.exec(&["identity", "delete", "ci", "--project", "billing", "--yes"]);
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    project_route.assert_async().await;
+    org_route.assert_async().await;
+    let json = stdout_json(&output);
+    assert_eq!(json["deleted"], true);
+    assert_eq!(json["scope"], "project");
+}
+
+#[tokio::test]
+async fn deleting_an_org_identity_uses_the_org_route() {
+    let mut server = mockito::Server::new_async().await;
+    server
+        .mock("GET", "/api/v1/identities")
+        .match_query(mockito::Matcher::Any)
+        .with_status(200)
+        .with_body(
+            r#"{"identities":[{"identityId":"i1","role":"admin",
+               "identity":{"id":"i1","name":"legacy","authMethods":[]}}],"totalCount":1}"#,
+        )
+        .create_async()
+        .await;
+    let org_route = server
+        .mock("DELETE", "/api/v1/identities/i1")
+        .with_status(200)
+        .with_body("")
+        .create_async()
+        .await;
+
+    let run = Run::new(&server.url());
+    let output = run.exec(&["identity", "delete", "legacy", "--yes"]);
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    org_route.assert_async().await;
+    assert_eq!(stdout_json(&output)["scope"], "organization");
+}
+
+#[tokio::test]
+async fn client_secret_attaches_universal_auth_when_absent() {
+    let mut server = mockito::Server::new_async().await;
+    server
+        .mock("GET", "/api/v1/identities")
+        .match_query(mockito::Matcher::Any)
+        .with_status(200)
+        .with_body(
+            r#"{"identities":[{"identityId":"i1","role":"admin",
+               "identity":{"id":"i1","name":"ci","authMethods":[]}}],"totalCount":1}"#,
+        )
+        .create_async()
+        .await;
+    // 404 is the one error that means "not attached yet" — the whole reason the
+    // NotFound variant exists.
+    server
+        .mock("GET", "/api/v1/auth/universal-auth/identities/i1")
+        .with_status(404)
+        .with_body(r#"{"message":"not configured"}"#)
+        .create_async()
+        .await;
+    let attach = server
+        .mock("POST", "/api/v1/auth/universal-auth/identities/i1")
+        .with_status(200)
+        .with_body(r#"{"identityUniversalAuth":{"clientId":"cid-9"}}"#)
+        .expect(1)
+        .create_async()
+        .await;
+    server
+        .mock(
+            "POST",
+            "/api/v1/auth/universal-auth/identities/i1/client-secrets",
+        )
+        .with_status(200)
+        .with_body(r#"{"clientSecret":"sk-secret","clientSecretData":{"id":"cs1"}}"#)
+        .create_async()
+        .await;
+
+    let run = Run::new(&server.url());
+    let output = run.exec(&["identity", "client-secret", "ci"]);
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    attach.assert_async().await;
+    let json = stdout_json(&output);
+    assert_eq!(json["clientId"], "cid-9");
+    assert_eq!(json["clientSecret"], "sk-secret");
+}
+
+#[tokio::test]
+async fn a_malformed_invocation_fails_as_json() {
+    // clap used to print English usage text and exit before the JSON machinery
+    // ran, so an agent generating a slightly wrong command line got something
+    // it could not parse.
+    let run = Run::new("http://127.0.0.1:1");
+    let output = run.exec(&["project", "create", "--name", "x", "--type", "nope"]);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(stderr_json(&output)["error"], "usage_error");
+    assert!(stdout(&output).is_empty());
+}
+
+#[tokio::test]
+async fn recoverable_failures_have_their_own_error_kinds() {
+    // An agent distinguishes "retry with --yes" from "this can never work"
+    // without reading prose.
+    let mut server = mockito::Server::new_async().await;
+    server
+        .mock("GET", "/api/v1/projects")
+        .with_status(200)
+        .with_body(TWO_PROJECTS)
+        .create_async()
+        .await;
+    server
+        .mock("GET", "/api/v1/projects/p1")
+        .with_status(200)
+        .with_body(r#"{"project":{"id":"p1","name":"billing","slug":"billing","environments":[]}}"#)
+        .create_async()
+        .await;
+
+    let run = Run::new(&server.url());
+    assert_eq!(
+        stderr_json(&run.exec(&["project", "delete", "billing"]))["error"],
+        "confirmation_required"
+    );
+    assert_eq!(
+        stderr_json(&run.exec(&["project", "update", "billing"]))["error"],
+        "nothing_to_update"
+    );
+}
+
+#[tokio::test]
+async fn a_mid_command_failure_leaves_stdout_empty() {
+    let mut server = mockito::Server::new_async().await;
+    server
+        .mock("GET", "/api/v1/projects")
+        .with_status(200)
+        .with_body(TWO_PROJECTS)
+        .create_async()
+        .await;
+    server
+        .mock("POST", "/api/v1/projects/p1/identities")
+        .with_status(200)
+        .with_body(r#"{"identity":{"id":"i9","name":"ci"}}"#)
+        .create_async()
+        .await;
+    server
+        .mock("PATCH", "/api/v1/projects/p1/memberships/identities/i9")
+        .with_status(401)
+        .with_body(r#"{"message":"token expired"}"#)
+        .create_async()
+        .await;
+    server
+        .mock("DELETE", "/api/v1/projects/p1/identities/i9")
+        .with_status(200)
+        .with_body("")
+        .create_async()
+        .await;
+
+    let run = Run::new(&server.url());
+    let output = run.exec(&["identity", "create", "--name", "ci", "--project", "billing"]);
+
+    // A partial write would show up here, mid-pipeline.
+    assert!(
+        stdout(&output).is_empty(),
+        "stdout leaked on failure: {}",
+        stdout(&output)
+    );
+    // Annotating the failure must not relabel it: an agent branching on
+    // not_logged_in has to re-authenticate, not retry.
+    let json = stderr_json(&output);
+    assert_eq!(json["error"], "not_logged_in");
+    assert_eq!(json["exitCode"], 2);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(json["message"].as_str().unwrap().contains("removed"));
 }
 
 #[tokio::test]

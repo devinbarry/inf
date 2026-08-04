@@ -219,9 +219,19 @@ Errors are JSON on stderr:
 ```
 
 `error` is a stable slug — match on it, not on `message`. The values are:
-`api_error`, `not_found`, `http_error`, `config_error`, `cli_not_found`,
-`not_logged_in`, `cli_failed`, `token_expired`, `forbidden`, `no_match`,
-`ambiguous_match`, `aborted`.
+`api_error`, `not_found`, `http_error`, `config_error`, `usage_error`,
+`confirmation_required`, `delete_protected`, `nothing_to_update`,
+`cli_not_found`, `not_logged_in`, `cli_failed`, `token_expired`, `forbidden`,
+`no_match`, `ambiguous_match`, `aborted`.
+
+The mechanically recoverable ones are worth special handling:
+`confirmation_required` (retry with `--yes`), `ambiguous_match` (pick a
+candidate id and retry), `not_logged_in` / `token_expired` (re-authenticate),
+and `nothing_to_update` (the command was a no-op).
+
+A malformed command line — an unknown flag, a bad `--type` — is
+`usage_error`, not clap's English usage text. `--help` and `--version` are the
+one deliberate exception: they are human-invoked, exit 0, and print plain text.
 
 Exit codes:
 

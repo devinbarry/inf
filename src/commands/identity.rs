@@ -86,13 +86,7 @@ pub async fn list(client: &InfisicalClient, project: Option<&str>, format: Forma
     // does not break silently against the other.
     let payload: Vec<serde_json::Value> = identities
         .iter()
-        .map(|i| {
-            let mut value = serde_json::to_value(i).unwrap_or_default();
-            value["id"] = json!(i.id());
-            value["name"] = json!(i.name());
-            value["role"] = json!(i.role());
-            value
-        })
+        .map(IdentityMembership::to_payload)
         .collect();
 
     output::emit(format, &payload, || match project {
@@ -122,27 +116,24 @@ pub async fn get(
     // safe to display and is required for every machine login — it is the one
     // field a script calling `identity get` actually wants, so it belongs in
     // the JSON too, not only in the human rendering.
-    let attached = identity
-        .identity
-        .auth_methods
-        .iter()
-        .any(|m| m == "universal-auth");
+    //
+    // Ask the server rather than gating on `authMethods`. The project
+    // membership route reports `authMethods: []` even when Universal Auth is
+    // attached, so gating meant `clientId` was permanently null for
+    // project-scoped identities — which are the only kind `inf` creates. A 404
+    // is the real "not attached" signal, the same rule `client_secret` uses.
     let mut universal_auth = None;
     let mut universal_auth_error = None;
-    if attached {
-        match client.get_universal_auth(identity.id()).await {
-            Ok(config) => universal_auth = Some(config),
-            // Never swallow this. Dropping the section on error told the reader
-            // the identity had no client id, while `authMethods` two lines
-            // above said it did.
-            Err(err) => universal_auth_error = Some(err.to_string()),
-        }
+    match client.get_universal_auth(identity.id()).await {
+        Ok(config) => universal_auth = Some(config),
+        Err(IfpError::NotFound(_)) => {}
+        // Never swallow anything else. Dropping the section on error told the
+        // reader the identity had no client id when the truth was a dead
+        // session or an unreachable instance.
+        Err(err) => universal_auth_error = Some(err.to_string()),
     }
 
-    let mut payload = serde_json::to_value(identity).unwrap_or_default();
-    payload["id"] = json!(identity.id());
-    payload["name"] = json!(identity.name());
-    payload["role"] = json!(identity.role());
+    let mut payload = identity.to_payload();
     payload["authMethods"] = json!(identity.identity.auth_methods);
     match &scope.project {
         Some(project) => {
@@ -323,30 +314,14 @@ async fn unwind(
         .delete_project_identity(project_id, identity_id)
         .await
     {
-        Ok(()) => annotate(
-            cause,
-            "The partially created identity was removed; nothing was left behind.".to_string(),
-        ),
-        Err(cleanup) => annotate(
-            cause,
-            format!(
-                "An identity was created but could not be configured or removed \
-                 (cleanup failed: {cleanup}).\nDelete it by id:\n  \
-                 inf identity delete {identity_id} --project {project_id} --yes"
-            ),
-        ),
-    }
-}
-
-/// Add context without discarding the error kind — agents match on `kind`, so
-/// collapsing everything to a generic API error would lose the reason.
-fn annotate(err: IfpError, note: String) -> IfpError {
-    match err {
-        IfpError::Api(m) => IfpError::Api(format!("{m}\n{note}")),
-        IfpError::NotFound(m) => IfpError::NotFound(format!("{m}\n{note}")),
-        IfpError::Forbidden(m) => IfpError::Forbidden(format!("{m}\n{note}")),
-        IfpError::Config(m) => IfpError::Config(format!("{m}\n{note}")),
-        other => IfpError::Api(format!("{other}\n{note}")),
+        Ok(()) => {
+            cause.annotate("The partially created identity was removed; nothing was left behind.")
+        }
+        Err(cleanup) => cause.annotate(format!(
+            "An identity was created but could not be configured or removed \
+             (cleanup failed: {cleanup}).\nDelete it by id:\n  \
+             inf identity delete {identity_id} --project {project_id} --yes"
+        )),
     }
 }
 

@@ -23,9 +23,11 @@ pub fn confirm(format: Format, assume_yes: bool, prompt: &str) -> Result<()> {
     }
 
     if !format.is_human() || !std::io::stdin().is_terminal() {
-        return Err(IfpError::Config(format!(
-            "{prompt}\nRefusing to continue without confirmation. Pass --yes to proceed."
-        )));
+        // Its own error kind: this is the one failure an agent can recover from
+        // mechanically, by retrying with --yes. Reporting it as a generic
+        // config error forced the caller to regex prose to tell it apart from
+        // delete protection or a bad flag combination.
+        return Err(IfpError::ConfirmationRequired(prompt.to_string()));
     }
 
     eprint!("{prompt} {} ", "[y/N]".dimmed());
@@ -63,6 +65,7 @@ mod tests {
         assert!(msg.contains("--yes"));
         assert!(msg.contains("billing"));
         assert_eq!(err.exit_code(), 2);
+        assert_eq!(err.kind(), "confirmation_required");
     }
 
     #[test]
@@ -72,5 +75,7 @@ mod tests {
         let err = confirm(Format::Json, false, "delete project 'billing'?").unwrap_err();
         assert!(err.to_string().contains("--yes"));
         assert_eq!(err.exit_code(), 2);
+        // Distinguishable from every other exit-2 failure without reading prose.
+        assert_eq!(err.kind(), "confirmation_required");
     }
 }

@@ -76,8 +76,8 @@ pub async fn update(
     format: Format,
 ) -> Result<()> {
     if name.is_none() && slug.is_none() && description.is_none() && delete_protection.is_none() {
-        return Err(IfpError::Config(
-            "nothing to update: pass at least one of --name, --slug, --description, \
+        return Err(IfpError::NothingToUpdate(
+            "pass at least one of --name, --slug, --description, \
              --delete-protection or --no-delete-protection"
                 .into(),
         ));
@@ -118,17 +118,17 @@ pub async fn delete(
     let projects = client.list_projects().await?;
     let matched = resolve::project(&projects, query)?;
 
-    // Re-fetch by id before reading `hasDeleteProtection`. The list route omits
-    // fields the detail route returns and the field defaults to `false` when
-    // absent, so trusting the listing would skip the guard exactly when it
-    // matters and hand the user an API rejection after they had already
-    // confirmed.
+    // Re-fetch by id before reading `hasDeleteProtection`. Current servers do
+    // return it from the list route, but the field defaults to `false` when
+    // absent, so any server or route that omits it would silently skip the
+    // guard — and this guard exists to fail *before* the user confirms an
+    // irreversible-sounding prompt. One extra GET is worth that.
     let project = client.get_project(&matched.id).await?;
 
     // Fail before the prompt rather than after it: the API rejects this and a
     // user who has already typed "y" deserves to know why it could never work.
     if project.has_delete_protection {
-        return Err(IfpError::Config(format!(
+        return Err(IfpError::DeleteProtected(format!(
             "project '{}' has delete protection enabled. Disable it first:\n  \
              inf project update {} --no-delete-protection",
             project.name, project.slug
@@ -168,7 +168,15 @@ pub async fn identities(client: &InfisicalClient, query: &str, format: Format) -
     let mut memberships = client.list_project_identities(&matched.id).await?;
     memberships.sort_by_key(|m| m.name().to_lowercase());
 
-    output::emit(format, &memberships, || {
+    // Same payload shape as `inf identity ls` — the README promises a computed
+    // `role`/`id`/`name` on identity listings, and emitting the raw membership
+    // here gave a caller `null` for all three.
+    let payload: Vec<serde_json::Value> = memberships
+        .iter()
+        .map(crate::models::IdentityMembership::to_payload)
+        .collect();
+
+    output::emit(format, &payload, || {
         output::project_identities_table(&memberships)
     });
     Ok(())
@@ -222,11 +230,17 @@ pub async fn env_create(
         }
     };
 
-    client.create_environment(&matched.id, name, slug).await?;
+    let response = client.create_environment(&matched.id, name, slug).await?;
 
-    // Report the environment as it now exists rather than the create response,
-    // whose envelope differs by version and carries no id the caller can use.
-    let created = reread_environment(client, &matched.id, slug).await?;
+    // The route answers {message, projectId, environment{...}}. Prefer that:
+    // re-reading the project instead turned a successful create into a failure
+    // whenever the follow-up read lagged, and the caller then retried into a
+    // duplicate-slug rejection. Fall back to a re-read only if the envelope is
+    // missing or shaped differently.
+    let created = match extract_environment(&response) {
+        Some(env) => env,
+        None => reread_environment(client, &matched.id, slug).await?,
+    };
 
     output::success(
         format,
@@ -248,9 +262,7 @@ pub async fn env_update(
     format: Format,
 ) -> Result<()> {
     if name.is_none() && slug.is_none() {
-        return Err(IfpError::Config(
-            "nothing to update: pass --name or --slug".into(),
-        ));
+        return Err(IfpError::NothingToUpdate("pass --name or --slug".into()));
     }
 
     let projects = client.list_projects().await?;
@@ -274,19 +286,24 @@ pub async fn env_update(
         }
     }
 
-    client
+    let response = client
         .update_environment(&project.id, &env_id, name, slug)
         .await?;
 
-    // Re-read so the reported slug is the new one; reporting `env.slug` here
-    // echoed the value the user had just replaced.
-    let project = client.get_project(&matched.id).await?;
-    let updated = project
-        .environments
-        .iter()
-        .find(|e| e.id == env_id)
-        .cloned()
-        .ok_or_else(|| IfpError::Api("environment vanished after update".into()))?;
+    // Report the new state, not `env.slug`, which echoed the value the user had
+    // just replaced. The response carries it; re-read only if it does not.
+    let updated = match extract_environment(&response) {
+        Some(env) => env,
+        None => {
+            let project = client.get_project(&matched.id).await?;
+            project
+                .environments
+                .iter()
+                .find(|e| e.id == env_id)
+                .cloned()
+                .ok_or_else(|| IfpError::Api("environment vanished after update".into()))?
+        }
+    };
 
     output::success(format, &format!("updated environment '{}'", updated.slug));
     output::emit(format, &updated, || {});
@@ -329,6 +346,11 @@ pub async fn env_delete(
         || {},
     );
     Ok(())
+}
+
+/// Pull the environment out of a mutation response envelope.
+fn extract_environment(response: &serde_json::Value) -> Option<Environment> {
+    serde_json::from_value(response.get("environment")?.clone()).ok()
 }
 
 async fn reread_environment(

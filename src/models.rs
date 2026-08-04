@@ -100,6 +100,22 @@ impl IdentityMembership {
         }
     }
 
+    /// The JSON shape every command emits for an identity.
+    ///
+    /// The two listing routes disagree about the same concept: the org route
+    /// sends a scalar `role` and the project route a `roles[]` array, and only
+    /// one of them sends `identityId`. Emitting the raw struct made a script
+    /// written against one listing read `null` against the other, so the
+    /// computed `id`, `name` and `role` are added on top of the raw fields.
+    /// Every command that returns an identity must go through this.
+    pub fn to_payload(&self) -> serde_json::Value {
+        let mut value = serde_json::to_value(self).unwrap_or_default();
+        value["id"] = serde_json::json!(self.id());
+        value["name"] = serde_json::json!(self.name());
+        value["role"] = serde_json::json!(self.role());
+        value
+    }
+
     /// Auth methods are what make an identity usable; one with none cannot log
     /// in at all, which is worth surfacing in listings.
     pub fn auth_methods(&self) -> String {
@@ -271,6 +287,28 @@ mod tests {
         });
         let m: IdentityMembership = serde_json::from_value(json).unwrap();
         assert_eq!(m.role(), "viewer,auditor");
+    }
+
+    #[test]
+    fn payload_is_identical_in_shape_across_both_listing_routes() {
+        // The org route sends a scalar `role`; the project route sends
+        // `roles[]` and no scalar. A script must not have to know which.
+        let org: IdentityMembership = serde_json::from_value(serde_json::json!({
+            "identityId": "i1", "role": "admin",
+            "identity": {"id": "i1", "name": "ci", "authMethods": ["universal-auth"]}
+        }))
+        .unwrap();
+        let project: IdentityMembership = serde_json::from_value(serde_json::json!({
+            "roles": [{"role": "admin", "customRoleSlug": null}],
+            "identity": {"id": "i1", "name": "ci", "authMethods": []}
+        }))
+        .unwrap();
+
+        for payload in [org.to_payload(), project.to_payload()] {
+            assert_eq!(payload["id"], "i1");
+            assert_eq!(payload["name"], "ci");
+            assert_eq!(payload["role"], "admin");
+        }
     }
 
     #[test]

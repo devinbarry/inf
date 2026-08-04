@@ -261,23 +261,54 @@ enum IdentityCommands {
     },
 }
 
+/// Parse, rendering clap's own failures through the JSON envelope.
+///
+/// `Cli::parse()` printed English usage text and exited before any of the JSON
+/// machinery ran, so an agent that generated a slightly wrong command line got
+/// an unparseable failure. `--help` and `--version` are the deliberate
+/// exception: they are human-invoked, exit 0, and keep clap's rendering.
+fn parse_or_exit() -> Cli {
+    match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(err) => {
+            use clap::error::ErrorKind;
+            if matches!(
+                err.kind(),
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+            ) {
+                let _ = err.print();
+                std::process::exit(0);
+            }
+            // `--human` may not have parsed, so decide the mode from argv.
+            let human = std::env::args().any(|a| a == "--human");
+            let error = error::IfpError::Usage(err.to_string().trim_end().to_string());
+            report(&error, Format::new(human));
+            std::process::exit(error.exit_code());
+        }
+    }
+}
+
+/// stdout stays reserved for the result, so failures go to stderr — as JSON by
+/// default, because the caller is normally a program that has to branch on the
+/// failure rather than read it.
+fn report(err: &error::IfpError, format: Format) {
+    if format.is_human() {
+        eprintln!("{} {err}", "error:".red().bold());
+    } else {
+        eprintln!(
+            "{}",
+            serde_json::to_string_pretty(&err.to_json()).unwrap_or_default()
+        );
+    }
+}
+
 #[tokio::main]
 async fn main() {
-    let cli = Cli::parse();
+    let cli = parse_or_exit();
     let format = Format::new(cli.human);
 
     if let Err(err) = run(cli).await {
-        // stdout stays reserved for the result, so failures go to stderr — as
-        // JSON by default, because the caller is normally a program that has to
-        // branch on the failure rather than read it.
-        if format.is_human() {
-            eprintln!("{} {err}", "error:".red().bold());
-        } else {
-            eprintln!(
-                "{}",
-                serde_json::to_string_pretty(&err.to_json()).unwrap_or_default()
-            );
-        }
+        report(&err, format);
         std::process::exit(err.exit_code());
     }
 }

@@ -48,6 +48,35 @@ pub enum IfpError {
     #[error("Config error: {0}")]
     Config(String),
 
+    /// The invocation itself was malformed — clap rejected it. Rendered through
+    /// the same JSON envelope as everything else so an agent that generates a
+    /// slightly wrong command line gets a parseable failure rather than English
+    /// usage text.
+    #[error("Usage error: {0}")]
+    Usage(String),
+
+    /// A destructive command was run without `--yes`. Its own kind because it
+    /// is the one failure an agent can recover from mechanically, by retrying
+    /// with the flag.
+    #[error("{0}\nRefusing to continue without confirmation. Pass --yes to proceed.")]
+    ConfirmationRequired(String),
+
+    /// Delete protection is enabled on the target. Distinct from a generic
+    /// config error because the remedy is a specific other command.
+    #[error("{0}")]
+    DeleteProtected(String),
+
+    /// An update command was given no fields to change.
+    #[error("nothing to update: {0}")]
+    NothingToUpdate(String),
+
+    /// An error with extra context attached. Wrapping rather than re-tagging
+    /// keeps the original `kind`, exit code and structured payload intact —
+    /// collapsing a mid-command `not_logged_in` into a generic API error told
+    /// agents to retry when they needed to re-authenticate.
+    #[error("{source}\n{note}")]
+    Annotated { source: Box<IfpError>, note: String },
+
     /// The `infisical` CLI is not on PATH. Without it there is no session to reuse.
     #[error("`infisical` CLI not found on PATH. Install it, then run `infisical login`")]
     CliNotFound,
@@ -97,7 +126,16 @@ impl IfpError {
             | IfpError::NotFound(_)
             | IfpError::Forbidden(_)
             | IfpError::Http(_) => 1,
+            IfpError::Annotated { source, .. } => source.exit_code(),
             _ => 2,
+        }
+    }
+
+    /// Attach context while preserving the underlying failure.
+    pub fn annotate(self, note: impl Into<String>) -> IfpError {
+        IfpError::Annotated {
+            source: Box::new(self),
+            note: note.into(),
         }
     }
 
@@ -110,6 +148,11 @@ impl IfpError {
             IfpError::NotFound(_) => "not_found",
             IfpError::Http(_) => "http_error",
             IfpError::Config(_) => "config_error",
+            IfpError::Usage(_) => "usage_error",
+            IfpError::ConfirmationRequired(_) => "confirmation_required",
+            IfpError::DeleteProtected(_) => "delete_protected",
+            IfpError::NothingToUpdate(_) => "nothing_to_update",
+            IfpError::Annotated { source, .. } => source.kind(),
             IfpError::CliNotFound => "cli_not_found",
             IfpError::NotLoggedIn => "not_logged_in",
             IfpError::CliFailed(_) => "cli_failed",
@@ -128,7 +171,13 @@ impl IfpError {
             "message": self.to_string(),
             "exitCode": self.exit_code(),
         });
-        if let IfpError::AmbiguousMatch { query, candidates } = self {
+        // Structured fields come from the innermost error, so wrapping never
+        // costs an agent the data it needs to recover.
+        let mut inner = self;
+        while let IfpError::Annotated { source, .. } = inner {
+            inner = source;
+        }
+        if let IfpError::AmbiguousMatch { query, candidates } = inner {
             value["query"] = serde_json::json!(query);
             value["candidates"] = serde_json::json!(candidates);
         }
