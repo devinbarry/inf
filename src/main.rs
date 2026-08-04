@@ -315,7 +315,7 @@ async fn main() {
 
 async fn run(cli: Cli) -> Result<()> {
     let format = Format::new(cli.human);
-    let config = Config::load(cli.domain.as_deref())?;
+    let config = Config::load(cli.domain.as_deref()).await?;
 
     // whoami is answered entirely from the decoded session, so it stays useful
     // when the API is unreachable.

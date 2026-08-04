@@ -2,7 +2,6 @@ use crate::error::{IfpError, Result};
 use base64::Engine;
 use serde::Deserialize;
 use std::path::PathBuf;
-use std::process::Command;
 
 /// Resolved session: where to talk to, what to send, and who we are.
 #[derive(Debug, Clone)]
@@ -39,8 +38,8 @@ struct JwtPayload {
 const DEFAULT_DOMAIN: &str = "https://app.infisical.com/api";
 
 impl Config {
-    pub fn load(domain_override: Option<&str>) -> Result<Self> {
-        let token = Self::read_cli_token()?;
+    pub async fn load(domain_override: Option<&str>) -> Result<Self> {
+        let token = Self::read_cli_token().await?;
         let payload = Self::decode_payload(&token)?;
 
         // The CLI keeps a RefreshToken field but never uses it, so an expired
@@ -54,12 +53,17 @@ impl Config {
         }
 
         // A token minted by `infisical login --method universal-auth` is an
-        // identity token, and the identity routes this tool drives are
-        // user-JWT-only. Catching it here beats a 403 three calls later.
+        // identity token. Rejecting it here is `inf`'s own policy, not a
+        // statement about what the API would accept: this tool reads the
+        // organization id out of the JWT payload and its whole session model is
+        // the user login, so a machine-identity token is outside what it is
+        // built to drive. (Older backends also rejected identity tokens on the
+        // identity routes outright; current upstream accepts them on some. The
+        // policy stands on the first reason, not the second.)
         if let Some(kind) = payload.auth_token_type.as_deref() {
             if kind != "accessToken" {
                 return Err(IfpError::Config(format!(
-                    "session is a '{kind}' token, but organization routes require a user login.\n\
+                    "session is a '{kind}' token, but inf drives the API as a logged-in user.\n\
                      Run `infisical login` (method: user) rather than a machine-identity login"
                 )));
             }
@@ -86,15 +90,45 @@ impl Config {
         self.expires_at.map(|exp| (exp - Self::now_unix()) / 86400)
     }
 
+    /// How long to wait for the CLI before giving up. It normally answers in
+    /// milliseconds; the ceiling exists because a wedged keyring agent would
+    /// otherwise hang every `inf` invocation forever with no output at all —
+    /// the worst possible failure for a caller that cannot see a terminal.
+    /// Overridable for a genuinely slow credential backend.
+    fn cli_timeout() -> std::time::Duration {
+        let secs = std::env::var("INF_CLI_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|secs| *secs > 0)
+            .unwrap_or(30);
+        std::time::Duration::from_secs(secs)
+    }
+
     /// Shell out rather than read the keyring directly. Infisical vendors a
     /// *forked* go-keyring whose API differs from upstream, and its `file`
     /// backend derives the passphrase from the config file; reimplementing
     /// either would couple us to internals that are free to change. The CLI
     /// already exposes the token, so let it do the work for both backends.
-    fn read_cli_token() -> Result<String> {
-        let output = Command::new("infisical")
+    async fn read_cli_token() -> Result<String> {
+        let timeout = Self::cli_timeout();
+        // stdin is closed: if the CLI ever decides to prompt (for a keyring
+        // passphrase, say) it must fail rather than block on a question no
+        // agent is there to answer.
+        let spawned = tokio::process::Command::new("infisical")
             .args(["user", "get", "token", "--plain", "--silent"])
-            .output()
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output();
+
+        let output = tokio::time::timeout(timeout, spawned)
+            .await
+            .map_err(|_| {
+                IfpError::CliTimeout(format!(
+                    "`infisical user get token` did not finish within {}s. \
+                     Check the credential store, or raise INF_CLI_TIMEOUT_SECS",
+                    timeout.as_secs()
+                ))
+            })?
             .map_err(|e| {
                 if e.kind() == std::io::ErrorKind::NotFound {
                     IfpError::CliNotFound

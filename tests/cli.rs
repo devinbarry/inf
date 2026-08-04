@@ -54,9 +54,21 @@ fn install_shim(dir: &Path) {
     }
 }
 
+/// A shim that never returns, standing in for a wedged keyring agent.
+fn install_hanging_shim(dir: &Path) {
+    let path = dir.join("infisical");
+    std::fs::write(&path, "#!/bin/sh\nsleep 300\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
 struct Run {
     shim_dir: tempfile::TempDir,
     api_url: String,
+    timeout_secs: Option<u64>,
 }
 
 impl Run {
@@ -66,6 +78,19 @@ impl Run {
         Self {
             shim_dir,
             api_url: api_url.to_string(),
+            timeout_secs: None,
+        }
+    }
+
+    /// A run whose `infisical` never answers, with the wait shortened so the
+    /// test does not sit on the 30s production default.
+    fn hanging() -> Self {
+        let shim_dir = tempfile::tempdir().unwrap();
+        install_hanging_shim(shim_dir.path());
+        Self {
+            shim_dir,
+            api_url: "http://127.0.0.1:1".to_string(),
+            timeout_secs: Some(1),
         }
     }
 
@@ -77,15 +102,18 @@ impl Run {
             self.shim_dir.path().display(),
             std::env::var("PATH").unwrap_or_default()
         );
-        Command::new(bin())
+        let mut command = Command::new(bin());
+        command
             .args(args)
             .env("PATH", path)
             .env("INFISICAL_DOMAIN", &self.api_url)
             // Colour codes would otherwise depend on whether the test harness
             // is attached to a terminal.
-            .env("NO_COLOR", "1")
-            .output()
-            .expect("failed to run inf")
+            .env("NO_COLOR", "1");
+        if let Some(secs) = self.timeout_secs {
+            command.env("INF_CLI_TIMEOUT_SECS", secs.to_string());
+        }
+        command.output().expect("failed to run inf")
     }
 }
 
@@ -632,6 +660,56 @@ async fn identity_get_reports_universal_auth_for_a_project_scoped_identity() {
     assert_eq!(json["clientId"], "cid-123");
     assert_eq!(json["role"], "viewer");
     assert_eq!(json["scope"], "project");
+}
+
+#[tokio::test]
+async fn a_wedged_infisical_cli_times_out_instead_of_hanging() {
+    // Without a timeout a stuck credential backend hung every inf invocation
+    // forever, producing no output at all — the worst failure for a caller that
+    // cannot see a terminal and has nothing to branch on.
+    let run = Run::hanging();
+    let started = std::time::Instant::now();
+    let output = run.exec(&["project", "ls"]);
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < std::time::Duration::from_secs(20),
+        "command did not give up promptly: {elapsed:?}"
+    );
+    assert_eq!(output.status.code(), Some(2));
+    let json = stderr_json(&output);
+    assert_eq!(json["error"], "cli_timeout");
+    assert!(stdout(&output).is_empty());
+}
+
+#[tokio::test]
+async fn identity_get_fails_when_the_universal_auth_lookup_errors() {
+    let mut server = mockito::Server::new_async().await;
+    server
+        .mock("GET", "/api/v1/identities")
+        .match_query(mockito::Matcher::Any)
+        .with_status(200)
+        .with_body(
+            r#"{"identities":[{"identityId":"i1","role":"admin",
+               "identity":{"id":"i1","name":"ci","authMethods":["universal-auth"]}}],"totalCount":1}"#,
+        )
+        .create_async()
+        .await;
+    // A 500 is not "no client id" — reporting clientId: null with exit 0 would
+    // be a silent wrong answer for the one field this command exists to give.
+    server
+        .mock("GET", "/api/v1/auth/universal-auth/identities/i1")
+        .with_status(500)
+        .with_body(r#"{"message":"internal error"}"#)
+        .create_async()
+        .await;
+
+    let run = Run::new(&server.url());
+    let output = run.exec(&["identity", "get", "ci"]);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(stderr_json(&output)["error"], "api_error");
+    assert!(stdout(&output).is_empty());
 }
 
 #[tokio::test]

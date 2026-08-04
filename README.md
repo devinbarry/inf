@@ -60,15 +60,23 @@ infisical login          # once, as a user
 inf whoami               # confirms instance, org and remaining session life
 ```
 
-This is required, not merely convenient. Infisical's identity-management routes
-accept a **user JWT only** — a Universal Auth machine identity is rejected with 403.
-Because `inf` manages identities, it has to run as a user.
+A **user** login specifically: `inf` reads the organization id out of the JWT
+payload and its whole session model assumes a logged-in user, so a token from
+`infisical login --method universal-auth` is rejected up front. That is `inf`'s
+own policy rather than a hard API limit — older Infisical backends rejected
+identity tokens on the identity routes outright, while current upstream accepts
+them on some — but the tool is not built to be driven that way.
 
 Sessions last 10 days and the official CLI never refreshes them, so `inf` detects
 expiry up front and tells you to log in again rather than surfacing an opaque 401.
 
 The instance URL is taken from `--domain`, then `$INFISICAL_DOMAIN`, then whichever
 instance `infisical login` last used.
+
+`inf` waits 30 seconds for `infisical` to hand over the token and then gives up
+with `cli_timeout`, so a wedged credential backend cannot hang a pipeline
+indefinitely. Raise `INF_CLI_TIMEOUT_SECS` if your keyring is genuinely slower
+than that.
 
 ## Global flags
 
@@ -221,13 +229,14 @@ Errors are JSON on stderr:
 `error` is a stable slug — match on it, not on `message`. The values are:
 `api_error`, `not_found`, `http_error`, `config_error`, `usage_error`,
 `confirmation_required`, `delete_protected`, `nothing_to_update`,
-`cli_not_found`, `not_logged_in`, `cli_failed`, `token_expired`, `forbidden`,
-`no_match`, `ambiguous_match`, `aborted`.
+`cli_not_found`, `not_logged_in`, `cli_failed`, `cli_timeout`, `token_expired`,
+`forbidden`, `no_match`, `ambiguous_match`, `aborted`.
 
 The mechanically recoverable ones are worth special handling:
 `confirmation_required` (retry with `--yes`), `ambiguous_match` (pick a
 candidate id and retry), `not_logged_in` / `token_expired` (re-authenticate),
-and `nothing_to_update` (the command was a no-op).
+`cli_timeout` (transient — retry), and `nothing_to_update` (the command was a
+no-op).
 
 A malformed command line — an unknown flag, a bad `--type` — is
 `usage_error`, not clap's English usage text. `--help` and `--version` are the

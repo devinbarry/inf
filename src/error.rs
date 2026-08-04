@@ -91,6 +91,11 @@ pub enum IfpError {
     #[error("`infisical` CLI failed: {0}")]
     CliFailed(String),
 
+    /// The CLI did not answer within the timeout. Its own kind because it is
+    /// transient and worth retrying, unlike a locked keyring, which is not.
+    #[error("`infisical` CLI timed out: {0}")]
+    CliTimeout(String),
+
     /// The CLI stores a refresh token but never uses it, so an expired session is
     /// terminal until the user logs in again. Say so plainly rather than letting
     /// the API return an opaque 401.
@@ -156,6 +161,7 @@ impl IfpError {
             IfpError::CliNotFound => "cli_not_found",
             IfpError::NotLoggedIn => "not_logged_in",
             IfpError::CliFailed(_) => "cli_failed",
+            IfpError::CliTimeout(_) => "cli_timeout",
             IfpError::TokenExpired(_) => "token_expired",
             IfpError::Forbidden(_) => "forbidden",
             IfpError::NoMatch(_) => "no_match",

@@ -122,16 +122,17 @@ pub async fn get(
     // attached, so gating meant `clientId` was permanently null for
     // project-scoped identities — which are the only kind `inf` creates. A 404
     // is the real "not attached" signal, the same rule `client_secret` uses.
-    let mut universal_auth = None;
-    let mut universal_auth_error = None;
-    match client.get_universal_auth(identity.id()).await {
-        Ok(config) => universal_auth = Some(config),
-        Err(IfpError::NotFound(_)) => {}
-        // Never swallow anything else. Dropping the section on error told the
-        // reader the identity had no client id when the truth was a dead
-        // session or an unreachable instance.
-        Err(err) => universal_auth_error = Some(err.to_string()),
-    }
+    let universal_auth = match client.get_universal_auth(identity.id()).await {
+        Ok(config) => Some(config),
+        // A 404 is the only "not attached" answer, and it is a real result.
+        Err(IfpError::NotFound(_)) => None,
+        // Anything else is a failure, and the command fails with it. Reporting
+        // `clientId: null` alongside exit 0 would tell a caller doing
+        // `jq -r .clientId` that no client id exists, when the truth is that
+        // the server errored — a silent wrong answer for the one field this
+        // command exists to produce.
+        Err(err) => return Err(err),
+    };
 
     let mut payload = identity.to_payload();
     payload["authMethods"] = json!(identity.identity.auth_methods);
@@ -145,16 +146,6 @@ pub async fn get(
     }
     payload["clientId"] = json!(universal_auth.as_ref().map(|c| c.client_id.clone()));
     payload["universalAuth"] = json!(universal_auth);
-    if let Some(err) = &universal_auth_error {
-        payload["universalAuthError"] = json!(err);
-    }
-
-    if let Some(err) = &universal_auth_error {
-        output::warn(
-            format,
-            &format!("could not read Universal Auth configuration: {err}"),
-        );
-    }
 
     output::emit(format, &payload, || {
         println!("{} {}", "Name:".bold(), identity.name());
