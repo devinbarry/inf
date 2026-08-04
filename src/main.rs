@@ -310,17 +310,29 @@ fn report(err: &error::IfpError, format: Format) {
 /// invocation, and it would produce both an exit code outside the documented
 /// set and a stderr that is not JSON. Dying from `SIGPIPE` like every other
 /// Unix tool is the honest behaviour.
-///
-/// Safe to call here: single-threaded, before the runtime or any I/O starts.
+#[cfg(unix)]
 fn restore_sigpipe() {
+    // Safe: called from `main` before the Tokio runtime is constructed, so the
+    // process is still single-threaded and nothing else can be handling
+    // signals concurrently.
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
 }
 
-#[tokio::main]
-async fn main() {
+#[cfg(not(unix))]
+fn restore_sigpipe() {}
+
+/// Deliberately a *synchronous* `main`. `#[tokio::main]` expands to a runtime
+/// built before the async body runs, so restoring the signal disposition
+/// inside that body would happen after worker threads already exist.
+fn main() {
     restore_sigpipe();
+    run_cli();
+}
+
+#[tokio::main]
+async fn run_cli() {
     let cli = parse_or_exit();
     let format = Format::new(cli.human);
 

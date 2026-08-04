@@ -100,10 +100,12 @@ and one project's slug may equal another's name. Without them the winner would
 depend on the order the API happened to return rows, which on `delete` means a
 silently wrong target.
 
-Environments are matched exactly — by id, slug, or name (case-insensitively),
-in that order. Substrings are deliberately not accepted there, because `dev`
-would otherwise also match `development` and the losing case is a deleted
-environment.
+Environments are matched by id, then slug, then name — case-sensitively. Only
+if all three miss is a case-insensitive pass made, and an ambiguity there is an
+error rather than a guess. An exact match therefore always beats a
+case-differing one. Substrings are deliberately not accepted for environments,
+because `dev` would otherwise also match `development` and the losing case is a
+deleted environment.
 
 ### Projects
 

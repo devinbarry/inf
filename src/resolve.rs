@@ -133,10 +133,16 @@ pub fn identity<'a>(
     }
 }
 
-/// Environments are scoped to one project, so an exact slug, id or name is
-/// unambiguous. A case-insensitive name is accepted as a convenience — but it
-/// is resolved under the same rule as everything else here: two environments
-/// differing only in case are an error, not a coin flip.
+/// Environments are scoped to one project, so an exact id, slug or name is
+/// unambiguous.
+///
+/// The three tiers are **case-sensitive**, and only once all of them miss is a
+/// case-insensitive pass made over slug and name together. So an exact match
+/// always beats a case-differing one, whatever tier the latter is in: with an
+/// environment slugged `qa` beside one *named* `QA`, the query `QA` returns the
+/// one actually named that. What the case-insensitive pass must never do is
+/// guess — two environments differing only in case are an error, not a coin
+/// flip.
 ///
 /// Substrings are deliberately *not* accepted. `dev` would otherwise match
 /// `dev` and `development`, and the losing case is a deleted environment.
@@ -325,6 +331,21 @@ mod tests {
 
         let err = environment(&project, "staging").unwrap_err();
         assert!(err.to_string().contains("dev, prod"));
+    }
+
+    #[test]
+    fn an_exact_name_beats_a_case_differing_slug() {
+        // The tiers are case-sensitive, so a query that exactly names one
+        // environment wins over one that only case-insensitively matches
+        // another's slug. Pinned because the reverse is a defensible reading of
+        // "id, then slug, then name" and the choice should not drift silently.
+        let project = project_with_envs(serde_json::json!([
+            {"id": "e1", "name": "Staging", "slug": "qa"},
+            {"id": "e2", "name": "QA", "slug": "eu"}
+        ]));
+        assert_eq!(environment(&project, "QA").unwrap().id, "e2");
+        // Lowercase `qa` is e1's exact slug, so the slug tier wins there.
+        assert_eq!(environment(&project, "qa").unwrap().id, "e1");
     }
 
     #[test]

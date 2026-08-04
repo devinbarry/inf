@@ -84,39 +84,61 @@ impl InfisicalClient {
             req = req.json(body);
         }
 
-        let response = req.send().await.map_err(|e| {
-            if e.is_timeout() {
-                IfpError::HttpTimeout(format!(
-                    "{} {} did not answer within {}s. \
-                     Retry, or raise INF_HTTP_TIMEOUT_SECS",
-                    method_label,
-                    url,
-                    Self::request_timeout().as_secs()
-                ))
-            } else {
-                IfpError::Http(e)
-            }
-        })?;
+        let response = req
+            .send()
+            .await
+            .map_err(|e| Self::transport_error(e, &method_label, &url))?;
         let status = response.status();
-        let text = response.text().await.unwrap_or_default();
+
+        // The body is a second place the transfer can stall. Discarding this
+        // error turned a timeout mid-body into an empty string, which then
+        // surfaced as "unexpected response shape: EOF" — an `api_error` for
+        // what was really `http_timeout`, and the wrong advice to the caller.
+        let text = match response.text().await {
+            Ok(text) => text,
+            Err(e) => {
+                // An unreadable body on an error status still leaves the status
+                // itself, which is the more useful diagnosis.
+                if !status.is_success() {
+                    return Err(Self::status_error(status, ""));
+                }
+                return Err(Self::transport_error(e, &method_label, &url));
+            }
+        };
 
         if status.is_success() {
             return Ok(text);
         }
 
+        Err(Self::status_error(status, &text))
+    }
+
+    fn transport_error(e: reqwest::Error, method: &str, url: &str) -> IfpError {
+        if e.is_timeout() {
+            IfpError::HttpTimeout(format!(
+                "{method} {url} did not complete within {}s. \
+                 Retry, or raise INF_HTTP_TIMEOUT_SECS",
+                Self::request_timeout().as_secs()
+            ))
+        } else {
+            IfpError::Http(e)
+        }
+    }
+
+    fn status_error(status: StatusCode, text: &str) -> IfpError {
         // Infisical answers 403 — not 401 — when a route rejects the caller's
         // auth mode, so a permission problem and a wrong-token-type problem
         // look identical without this hint.
-        Err(match status {
+        match status {
             StatusCode::FORBIDDEN => IfpError::Forbidden(format!(
                 "{}\nThis route may require an organization role with the necessary permission, \
                  or a user login rather than a machine identity.",
-                Self::extract_message(&text)
+                Self::extract_message(text)
             )),
             StatusCode::UNAUTHORIZED => IfpError::NotLoggedIn,
-            StatusCode::NOT_FOUND => IfpError::NotFound(Self::extract_message(&text)),
-            _ => IfpError::Api(format!("{} {}", status, Self::extract_message(&text))),
-        })
+            StatusCode::NOT_FOUND => IfpError::NotFound(Self::extract_message(text)),
+            _ => IfpError::Api(format!("{} {}", status, Self::extract_message(text))),
+        }
     }
 
     /// API errors arrive as JSON with a `message`. Show that rather than the

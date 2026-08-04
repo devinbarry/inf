@@ -681,10 +681,20 @@ async fn a_closed_stdout_does_not_panic() {
     // `println!` answered with a panic: exit 101 — outside the documented set —
     // and a Rust backtrace on stderr, which is not JSON.
     let mut server = mockito::Server::new_async().await;
+    // Enough projects that the pretty-printed array comfortably exceeds the
+    // 64 KiB pipe buffer. With a two-row payload the whole response fits in the
+    // buffer, the write never fails, and the test proves nothing.
+    let many: Vec<String> = (0..5000)
+        .map(|n| {
+            format!(
+                r#"{{"id":"p{n}","name":"project-{n}","slug":"project-{n}","environments":[]}}"#
+            )
+        })
+        .collect();
     server
         .mock("GET", "/api/v1/projects")
         .with_status(200)
-        .with_body(TWO_PROJECTS)
+        .with_body(format!(r#"{{"projects":[{}]}}"#, many.join(",")))
         .create_async()
         .await;
 
@@ -703,6 +713,15 @@ async fn a_closed_stdout_does_not_panic() {
         .output()
         .expect("failed to run pipeline");
 
+    // Prove the command actually ran and emitted JSON. Without this the
+    // assertions below are satisfied by an early config error that merely
+    // failed to panic.
+    assert_eq!(
+        stdout(&output).trim(),
+        "[",
+        "pipeline produced no JSON; stderr: {}",
+        stderr(&output)
+    );
     let err = stderr(&output);
     assert!(
         !err.contains("panicked"),
