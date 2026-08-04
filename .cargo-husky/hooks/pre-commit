@@ -1,0 +1,12 @@
+#!/bin/sh
+set -e
+
+echo "pre-commit: checking formatting..."
+if ! cargo fmt --check; then
+    echo ""
+    echo "ERROR: Code is not formatted. Run 'cargo fmt' and re-stage."
+    exit 1
+fi
+
+echo "pre-commit: running clippy..."
+cargo clippy -- -D warnings
