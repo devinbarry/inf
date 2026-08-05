@@ -5,6 +5,25 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-08-05
+
+### Added
+
+- SSH project recovery controls: list, rename, enable or disable certificate
+  authorities; retrieve their public keys; and list or create constrained
+  User-certificate templates.
+- A fixed least-privilege SSH issuer role whose only permission is
+  `ssh-certificates:create`.
+- A bounded Universal Auth profile for SSH issuers with 900-second access
+  tokens and lockout protection.
+- Project creation controls for omitting irrelevant default environments and
+  enabling deletion protection immediately.
+
+### Fixed
+
+- SSH CA public keys are decoded from the API's plain-text response rather
+  than incorrectly treating them as JSON.
+
 ## [0.2.0] - 2026-08-04
 
 Correctness release from a four-round cross-model review. Everything here is a
