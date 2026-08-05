@@ -20,6 +20,19 @@ pub struct Project {
     pub created_at: Option<String>,
     #[serde(default)]
     pub environments: Vec<Environment>,
+    #[serde(default)]
+    pub roles: Vec<ProjectRole>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectRole {
+    pub id: String,
+    pub name: String,
+    pub slug: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub permissions: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,6 +42,42 @@ pub struct Environment {
     pub slug: String,
     #[serde(default)]
     pub position: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SshCa {
+    pub id: String,
+    #[serde(rename = "projectId")]
+    pub project_id: String,
+    #[serde(rename = "friendlyName")]
+    pub friendly_name: String,
+    pub status: String,
+    #[serde(rename = "keyAlgorithm")]
+    pub key_algorithm: String,
+    #[serde(rename = "keySource")]
+    pub key_source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SshCertificateTemplate {
+    pub id: String,
+    #[serde(rename = "sshCaId")]
+    pub ssh_ca_id: String,
+    pub name: String,
+    pub status: String,
+    pub ttl: String,
+    #[serde(rename = "maxTTL")]
+    pub max_ttl: String,
+    #[serde(rename = "allowedUsers", default)]
+    pub allowed_users: Vec<String>,
+    #[serde(rename = "allowedHosts", default)]
+    pub allowed_hosts: Vec<String>,
+    #[serde(rename = "allowCustomKeyIds")]
+    pub allow_custom_key_ids: bool,
+    #[serde(rename = "allowUserCertificates")]
+    pub allow_user_certificates: bool,
+    #[serde(rename = "allowHostCertificates")]
+    pub allow_host_certificates: bool,
 }
 
 /// An identity's membership in an organization. The API nests the identity

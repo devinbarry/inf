@@ -1,4 +1,4 @@
-use crate::models::{IdentityMembership, Project};
+use crate::models::{IdentityMembership, Project, SshCa, SshCertificateTemplate};
 use colored::Colorize;
 use serde::Serialize;
 use unicode_width::UnicodeWidthStr;
@@ -193,6 +193,38 @@ pub fn project_detail(project: &Project) {
         .map(|e| vec![e.name.clone(), e.slug.clone(), e.id.clone()])
         .collect();
     table(&["NAME", "SLUG", "ID"], &rows);
+}
+
+pub fn ssh_cas_table(cas: &[SshCa]) {
+    let rows = cas
+        .iter()
+        .map(|ca| {
+            vec![
+                ca.friendly_name.clone(),
+                ca.status.clone(),
+                ca.key_algorithm.clone(),
+                ca.key_source.clone(),
+                ca.id.clone(),
+            ]
+        })
+        .collect::<Vec<_>>();
+    table(&["NAME", "STATUS", "ALGORITHM", "SOURCE", "ID"], &rows);
+}
+
+pub fn ssh_templates_table(templates: &[SshCertificateTemplate]) {
+    let rows = templates
+        .iter()
+        .map(|template| {
+            vec![
+                template.name.clone(),
+                template.allowed_users.join(","),
+                template.ttl.clone(),
+                template.max_ttl.clone(),
+                template.id.clone(),
+            ]
+        })
+        .collect::<Vec<_>>();
+    table(&["NAME", "PRINCIPALS", "TTL", "MAX TTL", "ID"], &rows);
 }
 
 /// Human-mode only. In JSON mode the result object on stdout already says what

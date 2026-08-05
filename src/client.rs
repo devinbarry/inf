@@ -1,6 +1,9 @@
 use crate::config::Config;
 use crate::error::{IfpError, Result};
-use crate::models::{ClientSecret, IdentityMembership, Project, UniversalAuthConfig};
+use crate::models::{
+    ClientSecret, IdentityMembership, Project, ProjectRole, SshCa, SshCertificateTemplate,
+    UniversalAuthConfig,
+};
 use reqwest::{Method, StatusCode};
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
@@ -213,10 +216,14 @@ impl InfisicalClient {
         slug: Option<&str>,
         description: Option<&str>,
         project_type: &str,
+        create_default_envs: bool,
+        has_delete_protection: bool,
     ) -> Result<Project> {
         let mut body = json!({
             "projectName": name,
             "type": project_type,
+            "shouldCreateDefaultEnvs": create_default_envs,
+            "hasDeleteProtection": has_delete_protection,
         });
         if let Some(slug) = slug {
             body["slug"] = json!(slug);
@@ -273,6 +280,137 @@ impl InfisicalClient {
         self.request(Method::DELETE, &format!("/v1/projects/{project_id}"), None)
             .await?;
         Ok(())
+    }
+
+    // -- SSH certificate authorities --
+
+    pub async fn list_ssh_cas(&self, project_id: &str) -> Result<Vec<SshCa>> {
+        #[derive(serde::Deserialize)]
+        struct Response {
+            cas: Vec<SshCa>,
+        }
+        let response: Response = self
+            .get_json(&format!("/v2/workspace/{project_id}/ssh-cas"))
+            .await?;
+        Ok(response.cas)
+    }
+
+    pub async fn update_ssh_ca(
+        &self,
+        ca_id: &str,
+        friendly_name: &str,
+        status: &str,
+    ) -> Result<SshCa> {
+        #[derive(serde::Deserialize)]
+        struct Response {
+            ca: SshCa,
+        }
+        let response: Response = self
+            .send_json(
+                Method::PATCH,
+                &format!("/v1/ssh/ca/{ca_id}"),
+                &json!({"friendlyName": friendly_name, "status": status}),
+            )
+            .await?;
+        Ok(response.ca)
+    }
+
+    pub async fn get_ssh_ca_public_key(&self, ca_id: &str) -> Result<String> {
+        let key = self
+            .request(Method::GET, &format!("/v1/ssh/ca/{ca_id}/public-key"), None)
+            .await?;
+        let key = key.trim().to_string();
+        if key.is_empty() {
+            return Err(IfpError::Api("SSH CA public-key response was empty".into()));
+        }
+        Ok(key)
+    }
+
+    pub async fn list_ssh_certificate_templates(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<SshCertificateTemplate>> {
+        #[derive(serde::Deserialize)]
+        struct Response {
+            #[serde(rename = "certificateTemplates")]
+            certificate_templates: Vec<SshCertificateTemplate>,
+        }
+        let response: Response = self
+            .get_json(&format!(
+                "/v2/workspace/{project_id}/ssh-certificate-templates"
+            ))
+            .await?;
+        Ok(response.certificate_templates)
+    }
+
+    pub async fn create_ssh_user_certificate_template(
+        &self,
+        ca_id: &str,
+        name: &str,
+        principals: &[String],
+        ttl: &str,
+        max_ttl: &str,
+    ) -> Result<SshCertificateTemplate> {
+        self.send_json(
+            Method::POST,
+            "/v1/ssh/certificate-templates",
+            &json!({
+                "sshCaId": ca_id,
+                "name": name,
+                "allowedUsers": principals,
+                "allowedHosts": [],
+                "allowUserCertificates": true,
+                "allowHostCertificates": false,
+                "allowCustomKeyIds": false,
+                "ttl": ttl,
+                "maxTTL": max_ttl,
+            }),
+        )
+        .await
+    }
+
+    pub async fn list_ssh_issuer_roles(&self, project_id: &str) -> Result<Vec<ProjectRole>> {
+        #[derive(serde::Deserialize)]
+        struct Response {
+            projects: Vec<Project>,
+        }
+        let response: Response = self
+            .get_json("/v1/projects?includeRoles=true&type=ssh")
+            .await?;
+        response
+            .projects
+            .into_iter()
+            .find(|project| project.id == project_id)
+            .map(|project| project.roles)
+            .ok_or_else(|| IfpError::NotFound(format!("SSH project {project_id}")))
+    }
+
+    /// Create the sole role used by an SSH certificate issuer. The permission
+    /// is intentionally fixed so this command cannot accidentally grant
+    /// secret, project, or administrative access.
+    pub async fn create_ssh_issuer_role(
+        &self,
+        project_id: &str,
+        name: &str,
+        slug: &str,
+    ) -> Result<ProjectRole> {
+        #[derive(serde::Deserialize)]
+        struct Response {
+            role: ProjectRole,
+        }
+        let response: Response = self
+            .send_json(
+                Method::POST,
+                &format!("/v1/projects/{project_id}/roles"),
+                &json!({
+                    "name": name,
+                    "slug": slug,
+                    "description": "May only request SSH certificates in this isolated project",
+                    "permissions": [{"subject": "ssh-certificates", "action": "create"}],
+                }),
+            )
+            .await?;
+        Ok(response.role)
     }
 
     // -- Environments --
@@ -385,6 +523,7 @@ impl InfisicalClient {
         let body = json!({
             "name": name,
             "roles": [{ "role": role, "isTemporary": false }],
+            "hasDeleteProtection": true,
         });
         self.send_json(
             Method::POST,
@@ -465,6 +604,42 @@ impl InfisicalClient {
                 Method::POST,
                 &format!("/v1/auth/universal-auth/identities/{identity_id}"),
                 &json!({}),
+            )
+            .await?;
+        Ok(response.config)
+    }
+
+    pub async fn attach_bounded_ssh_universal_auth(
+        &self,
+        identity_id: &str,
+    ) -> Result<UniversalAuthConfig> {
+        #[derive(serde::Deserialize)]
+        struct Response {
+            #[serde(rename = "identityUniversalAuth")]
+            config: UniversalAuthConfig,
+        }
+        let response: Response = self
+            .send_json(
+                Method::POST,
+                &format!("/v1/auth/universal-auth/identities/{identity_id}"),
+                &json!({
+                    "clientSecretTrustedIps": [
+                        {"ipAddress": "0.0.0.0/0"},
+                        {"ipAddress": "::/0"}
+                    ],
+                    "accessTokenTrustedIps": [
+                        {"ipAddress": "0.0.0.0/0"},
+                        {"ipAddress": "::/0"}
+                    ],
+                    "accessTokenTTL": 900,
+                    "accessTokenMaxTTL": 900,
+                    "accessTokenNumUsesLimit": 0,
+                    "accessTokenPeriod": 0,
+                    "lockoutEnabled": true,
+                    "lockoutThreshold": 3,
+                    "lockoutDurationSeconds": 300,
+                    "lockoutCounterResetSeconds": 30
+                }),
             )
             .await?;
         Ok(response.config)
@@ -606,6 +781,85 @@ mod tests {
         assert_eq!(projects.len(), 1);
         assert_eq!(projects[0].name, "billing");
         assert_eq!(projects[0].environments[0].slug, "dev");
+    }
+
+    #[tokio::test]
+    async fn ssh_ca_public_key_accepts_the_plain_text_api_response() {
+        let mut server = mockito::Server::new_async().await;
+        let key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest fleet-ca";
+        let mock = server
+            .mock("GET", "/v1/ssh/ca/ca-1/public-key")
+            .with_status(200)
+            .with_body(format!("{key}\n"))
+            .create_async()
+            .await;
+
+        let client = InfisicalClient::with_parts(&server.url(), "t", "org-1");
+        assert_eq!(client.get_ssh_ca_public_key("ca-1").await.unwrap(), key);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn ssh_issuer_role_has_exactly_one_fixed_permission() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/v1/projects/p1/roles")
+            .match_body(mockito::Matcher::Json(json!({
+                "name": "Issuer",
+                "slug": "issuer",
+                "description": "May only request SSH certificates in this isolated project",
+                "permissions": [{"subject": "ssh-certificates", "action": "create"}],
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"role":{"id":"r1","name":"Issuer","slug":"issuer",
+                    "permissions":[{"action":["create"],"subject":"ssh-certificates"}]}}"#,
+            )
+            .create_async()
+            .await;
+
+        let client = InfisicalClient::with_parts(&server.url(), "t", "org-1");
+        let role = client
+            .create_ssh_issuer_role("p1", "Issuer", "issuer")
+            .await
+            .unwrap();
+        assert_eq!(role.slug, "issuer");
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn bounded_ssh_auth_sends_the_recovery_profile() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/v1/auth/universal-auth/identities/i1")
+            .match_body(mockito::Matcher::PartialJson(json!({
+                "accessTokenTTL": 900,
+                "accessTokenMaxTTL": 900,
+                "accessTokenNumUsesLimit": 0,
+                "accessTokenPeriod": 0,
+                "lockoutEnabled": true,
+                "lockoutThreshold": 3,
+                "lockoutDurationSeconds": 300,
+                "lockoutCounterResetSeconds": 30,
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"identityUniversalAuth":{"clientId":"client-1",
+                    "accessTokenTTL":900,"accessTokenMaxTTL":900}}"#,
+            )
+            .create_async()
+            .await;
+
+        let client = InfisicalClient::with_parts(&server.url(), "t", "org-1");
+        let config = client
+            .attach_bounded_ssh_universal_auth("i1")
+            .await
+            .unwrap();
+        assert_eq!(config.access_token_ttl, Some(900));
+        assert_eq!(config.access_token_max_ttl, Some(900));
+        mock.assert_async().await;
     }
 
     #[tokio::test]
@@ -769,7 +1023,7 @@ mod tests {
 
         let client = InfisicalClient::with_parts(&server.url(), "t", "org-1");
         let project = client
-            .create_project("new-svc", None, None, "secret-manager")
+            .create_project("new-svc", None, None, "secret-manager", true, false)
             .await
             .unwrap();
 

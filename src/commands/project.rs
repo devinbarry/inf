@@ -24,16 +24,26 @@ pub async fn get(client: &InfisicalClient, query: &str, format: Format) -> Resul
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn create(
     client: &InfisicalClient,
     name: &str,
     slug: Option<&str>,
     description: Option<&str>,
     project_type: &str,
+    create_default_envs: bool,
+    has_delete_protection: bool,
     format: Format,
 ) -> Result<()> {
     let project = client
-        .create_project(name, slug, description, project_type)
+        .create_project(
+            name,
+            slug,
+            description,
+            project_type,
+            create_default_envs,
+            has_delete_protection,
+        )
         .await?;
 
     output::success(

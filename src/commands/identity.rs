@@ -191,6 +191,7 @@ pub async fn create(
     project: &str,
     role: &str,
     with_universal_auth: bool,
+    bounded_ssh_universal_auth: bool,
     format: Format,
 ) -> Result<()> {
     let projects = client.list_projects().await?;
@@ -226,11 +227,11 @@ pub async fn create(
     }
 
     let mut credentials = None;
-    if with_universal_auth {
+    if with_universal_auth || bounded_ssh_universal_auth {
         // A fresh identity has no auth method and cannot log in. Attach
         // Universal Auth and mint one secret so the caller ends up with a
         // usable credential pair rather than a half-configured identity.
-        match attach_and_mint(client, &identity_id).await {
+        match attach_and_mint(client, &identity_id, bounded_ssh_universal_auth).await {
             Ok(pair) => credentials = Some(pair),
             Err(err) => return Err(unwind(client, &project_id, &identity_id, err).await),
         }
@@ -282,8 +283,18 @@ pub async fn create(
     Ok(())
 }
 
-async fn attach_and_mint(client: &InfisicalClient, identity_id: &str) -> Result<(String, String)> {
-    let config = client.attach_universal_auth(identity_id).await?;
+async fn attach_and_mint(
+    client: &InfisicalClient,
+    identity_id: &str,
+    bounded_ssh: bool,
+) -> Result<(String, String)> {
+    let config = if bounded_ssh {
+        client
+            .attach_bounded_ssh_universal_auth(identity_id)
+            .await?
+    } else {
+        client.attach_universal_auth(identity_id).await?
+    };
     let secret = client
         .create_client_secret(identity_id, "created by inf", 0, 0)
         .await?;
@@ -493,6 +504,44 @@ pub async fn client_secret(
     output::warn(
         format,
         "the client secret is shown once and cannot be retrieved again",
+    );
+    Ok(())
+}
+
+pub async fn attach_bounded_ssh_auth(
+    client: &InfisicalClient,
+    query: &str,
+    project: &str,
+    format: Format,
+) -> Result<()> {
+    let scope = resolve_scope(client, Some(project), query).await?;
+    let identity_id = scope.identity.id().to_string();
+    match client.get_universal_auth(&identity_id).await {
+        Ok(_) => {
+            return Err(IfpError::Config(format!(
+                "identity '{}' already has Universal Auth attached",
+                scope.identity.name()
+            )))
+        }
+        Err(IfpError::NotFound(_)) => {}
+        Err(err) => return Err(err),
+    }
+    let config = client
+        .attach_bounded_ssh_universal_auth(&identity_id)
+        .await?;
+    output::emit(
+        format,
+        &json!({
+            "id": identity_id,
+            "name": scope.identity.name(),
+            "clientId": config.client_id,
+            "accessTokenTTL": config.access_token_ttl,
+            "profile": "bounded-ssh-issuer"
+        }),
+        || {
+            println!("{} {}", "Client ID:".bold(), config.client_id);
+            println!("{}", "Bounded SSH issuer profile attached".bold());
+        },
     );
     Ok(())
 }

@@ -51,6 +51,9 @@ enum Commands {
     /// Manage machine identities
     #[command(subcommand, visible_alias = "id")]
     Identity(IdentityCommands),
+    /// Manage SSH certificate authorities and certificate templates
+    #[command(subcommand)]
+    Ssh(SshCommands),
 }
 
 #[derive(Subcommand)]
@@ -79,6 +82,12 @@ enum ProjectCommands {
         #[arg(long, default_value = "secret-manager",
               value_parser = ["secret-manager", "cert-manager", "kms", "ssh", "secret-scanning", "pam", "ai"])]
         r#type: String,
+        /// Do not create Development, Staging and Production environments
+        #[arg(long)]
+        no_default_envs: bool,
+        /// Block deletion immediately
+        #[arg(long)]
+        delete_protection: bool,
     },
     /// Rename a project
     Rename {
@@ -209,6 +218,10 @@ enum IdentityCommands {
         /// identity is immediately usable
         #[arg(long)]
         with_universal_auth: bool,
+        /// Attach the locked-down 900-second Universal Auth profile used by
+        /// SSH certificate issuers, then mint one client secret
+        #[arg(long, conflicts_with = "with_universal_auth")]
+        bounded_ssh_universal_auth: bool,
     },
     /// Rename an identity
     Rename {
@@ -258,6 +271,98 @@ enum IdentityCommands {
         /// Maximum number of uses; 0 means unlimited
         #[arg(long, default_value_t = 0)]
         num_uses: i64,
+    },
+    /// Attach the locked-down 900-second SSH issuer auth profile without
+    /// creating a client secret
+    AttachBoundedSshAuth {
+        /// Identity id, name, or a unique substring
+        query: String,
+        /// Project the identity is scoped to
+        #[arg(long)]
+        project: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum SshCommands {
+    /// Manage SSH certificate authorities
+    #[command(subcommand)]
+    Ca(SshCaCommands),
+    /// Manage SSH User-certificate templates
+    #[command(subcommand)]
+    Template(SshTemplateCommands),
+    /// Manage the fixed one-permission certificate issuer role
+    #[command(subcommand)]
+    IssuerRole(SshIssuerRoleCommands),
+}
+
+#[derive(Subcommand)]
+enum SshIssuerRoleCommands {
+    /// List project roles for an SSH project
+    #[command(visible_alias = "list")]
+    Ls { project: String },
+    /// Create a role that can only issue SSH certificates
+    Create {
+        project: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        slug: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum SshCaCommands {
+    /// List the User and Host CAs in an SSH project
+    #[command(visible_alias = "list")]
+    Ls {
+        /// SSH project id, slug, name, or a unique substring
+        project: String,
+    },
+    /// Rename a CA and set its status
+    Update {
+        /// SSH project id, slug, name, or a unique substring
+        project: String,
+        /// CA id, friendly name, or a unique substring
+        ca: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long, default_value = "active", value_parser = ["active", "disabled"])]
+        status: String,
+    },
+    /// Return a CA public key
+    PublicKey {
+        /// SSH project id, slug, name, or a unique substring
+        project: String,
+        /// CA id, friendly name, or a unique substring
+        ca: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum SshTemplateCommands {
+    /// List User-certificate templates in an SSH project
+    #[command(visible_alias = "list")]
+    Ls {
+        /// SSH project id, slug, name, or a unique substring
+        project: String,
+    },
+    /// Create a constrained User-certificate template
+    Create {
+        /// SSH project id, slug, name, or a unique substring
+        project: String,
+        /// CA id, friendly name, or a unique substring
+        #[arg(long, default_value = "User CA")]
+        ca: String,
+        #[arg(long)]
+        name: String,
+        /// Allowed certificate principal. Repeat for more than one.
+        #[arg(long, required = true)]
+        principal: Vec<String>,
+        #[arg(long, default_value = "30m")]
+        ttl: String,
+        #[arg(long, default_value = "30m")]
+        max_ttl: String,
     },
 }
 
@@ -365,6 +470,8 @@ async fn run(cli: Cli) -> Result<()> {
                 slug,
                 description,
                 r#type,
+                no_default_envs,
+                delete_protection,
             } => {
                 commands::project::create(
                     &client,
@@ -372,6 +479,8 @@ async fn run(cli: Cli) -> Result<()> {
                     slug.as_deref(),
                     description.as_deref(),
                     &r#type,
+                    !no_default_envs,
+                    delete_protection,
                     format,
                 )
                 .await
@@ -456,6 +565,7 @@ async fn run(cli: Cli) -> Result<()> {
                 project,
                 role,
                 with_universal_auth,
+                bounded_ssh_universal_auth,
             } => {
                 commands::identity::create(
                     &client,
@@ -463,6 +573,7 @@ async fn run(cli: Cli) -> Result<()> {
                     &project,
                     &role,
                     with_universal_auth,
+                    bounded_ssh_universal_auth,
                     format,
                 )
                 .await
@@ -503,6 +614,56 @@ async fn run(cli: Cli) -> Result<()> {
                 )
                 .await
             }
+            IdentityCommands::AttachBoundedSshAuth { query, project } => {
+                commands::identity::attach_bounded_ssh_auth(&client, &query, &project, format).await
+            }
+        },
+
+        Commands::Ssh(command) => match command {
+            SshCommands::Ca(command) => match command {
+                SshCaCommands::Ls { project } => {
+                    commands::ssh::ca_list(&client, &project, format).await
+                }
+                SshCaCommands::Update {
+                    project,
+                    ca,
+                    name,
+                    status,
+                } => commands::ssh::ca_update(&client, &project, &ca, &name, &status, format).await,
+                SshCaCommands::PublicKey { project, ca } => {
+                    commands::ssh::ca_public_key(&client, &project, &ca, format).await
+                }
+            },
+            SshCommands::Template(command) => match command {
+                SshTemplateCommands::Ls { project } => {
+                    commands::ssh::template_list(&client, &project, format).await
+                }
+                SshTemplateCommands::Create {
+                    project,
+                    ca,
+                    name,
+                    principal,
+                    ttl,
+                    max_ttl,
+                } => {
+                    commands::ssh::template_create(
+                        &client, &project, &ca, &name, &principal, &ttl, &max_ttl, format,
+                    )
+                    .await
+                }
+            },
+            SshCommands::IssuerRole(command) => match command {
+                SshIssuerRoleCommands::Ls { project } => {
+                    commands::ssh::issuer_role_list(&client, &project, format).await
+                }
+                SshIssuerRoleCommands::Create {
+                    project,
+                    name,
+                    slug,
+                } => {
+                    commands::ssh::issuer_role_create(&client, &project, &name, &slug, format).await
+                }
+            },
         },
     }
 }

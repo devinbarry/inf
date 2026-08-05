@@ -1,5 +1,6 @@
 pub mod identity;
 pub mod project;
+pub mod ssh;
 
 use crate::error::{IfpError, Result};
 use crate::output::Format;
