@@ -92,7 +92,7 @@ release-finish:
     fi
     git tag -a "v${VERSION}" -m "v${VERSION}"
     git push && git push --tags
-    cargo install --path . --force
+    cargo install --locked --path . --force
     echo ""
     echo "Released v${VERSION}"
 
@@ -116,4 +116,4 @@ check:
 
 # Install binary to ~/.cargo/bin (cargo default)
 install:
-    cargo install --path . --force
+    cargo install --locked --path . --force
