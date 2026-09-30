@@ -11,6 +11,28 @@ commands — those live only in the REST API and the web UI. `inf` fills that ga
 crate: ifp        binary: inf
 ```
 
+
+## Workstation credential safety
+
+This version requires the agent-safe Infisical CLI fork on the workstation. Session reuse uses an explicit private
+pipe (`user get token --plain --output-fd=3`); credential bytes never travel on public stdout. Containers, servers
+and deployed automation may continue using upstream Infisical independently.
+
+Commands that issue a one-time client secret require its destination before creating it:
+
+```sh
+inf identity client-secret ci-reader --project billing --output-file /private/new-credential.json
+inf identity create --name ci-reader --project billing --with-universal-auth --output-file /private/new-identity.json
+```
+
+Files must be new and are created mode 0600. An inherited writable private pipe/file descriptor can be selected with
+`--output-fd` (>= 3). `--human` does not reveal credentials or bypass private delivery.
+
+Deliberate display requires both `--reveal` and `--acknowledge-secret-exposure`. The values can then enter the agent's
+context and persistent history. There is no saved opt-out. API response bodies and arbitrary credential-source
+stderr are withheld from errors; stable error kinds and HTTP status remain available.
+
+
 ## Built for agents, not for eyes
 
 This is the design constraint everything else follows from. The expected caller
@@ -156,7 +178,7 @@ Identities are **always scoped to a single project**, and default to a
 project's identities; without it, the organization's.
 
 ```sh
-inf identity create --name ci-reader --project billing --with-universal-auth
+inf identity create --name ci-reader --project billing --with-universal-auth --output-file /private/new-identity.json
 inf identity ls --project billing
 inf identity get ci-reader --project billing
 inf identity set-role ci-reader --project billing --role viewer

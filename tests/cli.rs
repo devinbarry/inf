@@ -42,7 +42,7 @@ fn install_shim(dir: &Path) {
     let script = format!(
         "#!/bin/sh\n\
          echo 'Important: repoint your machine to https://artifacts-p.infisical.com'\n\
-         echo '{}'\n",
+         echo '{}' >&3\n",
         session_token()
     );
     let path = dir.join("infisical");
@@ -593,7 +593,7 @@ async fn a_failed_role_assignment_unwinds_the_new_identity() {
     // command resolving by name becomes ambiguous.
     cleanup.assert_async().await;
     let json = stderr_json(&output);
-    assert!(json["message"].as_str().unwrap().contains("Invalid role"));
+    assert!(json["message"].as_str().unwrap().contains("400"));
     assert!(json["message"].as_str().unwrap().contains("removed"));
 }
 
@@ -626,7 +626,13 @@ async fn client_secret_does_not_mistake_an_expired_session_for_a_missing_method(
         .await;
 
     let run = Run::new(&server.url());
-    let output = run.exec(&["identity", "client-secret", "ci"]);
+    let output = run.exec(&[
+        "identity",
+        "client-secret",
+        "ci",
+        "--reveal",
+        "--acknowledge-secret-exposure",
+    ]);
 
     assert_eq!(output.status.code(), Some(2));
     assert_eq!(stderr_json(&output)["error"], "not_logged_in");
@@ -995,11 +1001,21 @@ async fn client_secret_attaches_universal_auth_when_absent() {
         .await;
 
     let run = Run::new(&server.url());
-    let output = run.exec(&["identity", "client-secret", "ci"]);
-
+    let destination = tempfile::tempdir().unwrap();
+    let path = destination.path().join("credential.json");
+    let output = run.exec(&[
+        "identity",
+        "client-secret",
+        "ci",
+        "--human",
+        "--output-file",
+        path.to_str().unwrap(),
+    ]);
     assert!(output.status.success(), "stderr: {}", stderr(&output));
     attach.assert_async().await;
-    let json = stdout_json(&output);
+    assert!(!stdout(&output).contains("sk-secret"));
+    assert!(!stderr(&output).contains("sk-secret"));
+    let json: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
     assert_eq!(json["clientId"], "cid-9");
     assert_eq!(json["clientSecret"], "sk-secret");
 }
@@ -1117,4 +1133,31 @@ async fn env_create_rejects_a_name_that_cannot_produce_a_slug() {
     assert!(json["message"].as_str().unwrap().contains("--slug"));
     // An empty slug must never reach the API.
     created.assert_async().await;
+}
+
+#[test]
+fn credential_issuance_requires_a_destination_before_authentication() {
+    let run = Run::new("http://127.0.0.1:1");
+    for args in [
+        vec!["identity", "client-secret", "ci"],
+        vec![
+            "identity",
+            "create",
+            "--name",
+            "ci",
+            "--project",
+            "example",
+            "--with-universal-auth",
+        ],
+    ] {
+        let output = run.exec(&args);
+        assert_eq!(output.status.code(), Some(2));
+        assert!(stdout(&output).is_empty());
+        assert_eq!(stderr_json(&output)["error"], "secret_delivery_required");
+    }
+    let output = run.exec(&["identity", "client-secret", "ci", "--reveal"]);
+    assert_eq!(
+        stderr_json(&output)["error"],
+        "secret_exposure_acknowledgement_required"
+    );
 }

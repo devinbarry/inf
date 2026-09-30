@@ -61,6 +61,12 @@ pub enum IfpError {
     #[error("Usage error: {0}")]
     Usage(String),
 
+    #[error("Displaying credentials exposes them to agent context and persistent history. Use both --reveal and --acknowledge-secret-exposure, or select private delivery.")]
+    ExposureAcknowledgementRequired,
+
+    #[error("This command issues a one-time credential. Select --output-file, --output-fd, or --reveal --acknowledge-secret-exposure before issuance.")]
+    SecretDeliveryRequired,
+
     /// A destructive command was run without `--yes`. Its own kind because it
     /// is the one failure an agent can recover from mechanically, by retrying
     /// with the flag.
@@ -166,6 +172,8 @@ impl IfpError {
             IfpError::HttpTimeout(_) => "http_timeout",
             IfpError::Config(_) => "config_error",
             IfpError::Usage(_) => "usage_error",
+            IfpError::ExposureAcknowledgementRequired => "secret_exposure_acknowledgement_required",
+            IfpError::SecretDeliveryRequired => "secret_delivery_required",
             IfpError::ConfirmationRequired(_) => "confirmation_required",
             IfpError::DeleteProtected(_) => "delete_protected",
             IfpError::NothingToUpdate(_) => "nothing_to_update",

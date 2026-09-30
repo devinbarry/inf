@@ -128,33 +128,16 @@ impl InfisicalClient {
         }
     }
 
-    fn status_error(status: StatusCode, text: &str) -> IfpError {
-        // Infisical answers 403 — not 401 — when a route rejects the caller's
-        // auth mode, so a permission problem and a wrong-token-type problem
-        // look identical without this hint.
+    fn status_error(status: StatusCode, _text: &str) -> IfpError {
+        // Error bodies are untrusted credential-bearing data, including otherwise useful message fields.
+        // Keep the stable error kind and HTTP status without returning the server's arbitrary strings.
         match status {
-            StatusCode::FORBIDDEN => IfpError::Forbidden(format!(
-                "{}\nThis route may require an organization role with the necessary permission, \
-                 or a user login rather than a machine identity.",
-                Self::extract_message(text)
-            )),
+            StatusCode::FORBIDDEN => IfpError::Forbidden(
+                "Insufficient permission. This route may require an organization role with the necessary permission, or a user login rather than a machine identity.".into()),
             StatusCode::UNAUTHORIZED => IfpError::NotLoggedIn,
-            StatusCode::NOT_FOUND => IfpError::NotFound(Self::extract_message(text)),
-            _ => IfpError::Api(format!("{} {}", status, Self::extract_message(text))),
+            StatusCode::NOT_FOUND => IfpError::NotFound("Resource not found".into()),
+            _ => IfpError::Api(format!("{status}; response details withheld")),
         }
-    }
-
-    /// API errors arrive as JSON with a `message`. Show that rather than the
-    /// whole envelope, but fall back to the raw body when the shape is unknown.
-    fn extract_message(body: &str) -> String {
-        serde_json::from_str::<Value>(body)
-            .ok()
-            .and_then(|v| {
-                v.get("message")
-                    .and_then(|m| m.as_str().map(str::to_string))
-                    .or_else(|| v.get("error").and_then(|e| e.as_str().map(str::to_string)))
-            })
-            .unwrap_or_else(|| body.trim().to_string())
     }
 
     async fn get_json<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
@@ -735,28 +718,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn extract_message_prefers_message_field() {
-        let body = r#"{"statusCode":403,"message":"Insufficient permission","error":"Forbidden"}"#;
-        assert_eq!(
-            InfisicalClient::extract_message(body),
-            "Insufficient permission"
-        );
-    }
-
-    #[test]
-    fn extract_message_falls_back_to_error_field() {
-        assert_eq!(
-            InfisicalClient::extract_message(r#"{"error":"Forbidden"}"#),
-            "Forbidden"
-        );
-    }
-
-    #[test]
-    fn extract_message_falls_back_to_raw_body() {
-        assert_eq!(
-            InfisicalClient::extract_message("upstream timeout\n"),
-            "upstream timeout"
-        );
+    fn error_bodies_never_disclose_credentials() {
+        for status in [
+            StatusCode::BAD_REQUEST,
+            StatusCode::FORBIDDEN,
+            StatusCode::NOT_FOUND,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            for body in [
+                r#"{"message":"synthetic-private-credential"}"#,
+                "synthetic-private-credential",
+            ] {
+                let error = InfisicalClient::status_error(status, body);
+                assert!(!error
+                    .to_json()
+                    .to_string()
+                    .contains("synthetic-private-credential"));
+            }
+        }
     }
 
     #[tokio::test]

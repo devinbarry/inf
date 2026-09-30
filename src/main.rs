@@ -1,6 +1,8 @@
 mod client;
 mod commands;
 mod config;
+mod credential_pipe;
+mod disclosure;
 mod error;
 mod models;
 mod output;
@@ -36,6 +38,22 @@ struct Cli {
     /// Output is JSON unless this is passed.
     #[arg(long, global = true)]
     human: bool,
+
+    /// Display real credentials (requires exposure acknowledgement).
+    #[arg(long, global = true)]
+    reveal: bool,
+
+    /// Acknowledge that displayed credentials can persist in agent context/history.
+    #[arg(long, global = true)]
+    acknowledge_secret_exposure: bool,
+
+    /// Deliver issued credentials to a new owner-private file.
+    #[arg(long, global = true)]
+    output_file: Option<std::path::PathBuf>,
+
+    /// Deliver issued credentials to an inherited private descriptor >= 3.
+    #[arg(long, global = true)]
+    output_fd: Option<i32>,
 
     #[command(subcommand)]
     command: Commands,
@@ -449,6 +467,25 @@ async fn run_cli() {
 
 async fn run(cli: Cli) -> Result<()> {
     let format = Format::new(cli.human);
+    let issues_credential = matches!(
+        &cli.command,
+        Commands::Identity(IdentityCommands::ClientSecret { .. })
+            | Commands::Identity(IdentityCommands::Create {
+                with_universal_auth: true,
+                ..
+            })
+            | Commands::Identity(IdentityCommands::Create {
+                bounded_ssh_universal_auth: true,
+                ..
+            })
+    );
+    disclosure::prepare(
+        cli.reveal,
+        cli.acknowledge_secret_exposure,
+        cli.output_file.as_deref(),
+        cli.output_fd,
+        issues_credential,
+    )?;
     let config = Config::load(cli.domain.as_deref()).await?;
 
     // whoami is answered entirely from the decoded session, so it stays useful

@@ -108,19 +108,15 @@ impl Config {
     /// *forked* go-keyring whose API differs from upstream, and its `file`
     /// backend derives the passphrase from the config file; reimplementing
     /// either would couple us to internals that are free to change. The CLI
-    /// already exposes the token, so let it do the work for both backends.
+    /// owns credential storage; request deliberate private delivery for both backends.
     async fn read_cli_token() -> Result<String> {
         let timeout = Self::cli_timeout();
         // stdin is closed: if the CLI ever decides to prompt (for a keyring
         // passphrase, say) it must fail rather than block on a question no
         // agent is there to answer.
-        let spawned = tokio::process::Command::new("infisical")
-            .args(["user", "get", "token", "--plain", "--silent"])
-            .stdin(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .output();
+        let spawned = crate::credential_pipe::capture_session();
 
-        let output = tokio::time::timeout(timeout, spawned)
+        let (output, token_bytes) = tokio::time::timeout(timeout, spawned)
             .await
             .map_err(|_| {
                 IfpError::CliTimeout(format!(
@@ -141,17 +137,20 @@ impl Config {
             // Not every failure is a missing session: a locked keyring or an
             // unreadable config file also exit non-zero. Sending those users to
             // `infisical login` wastes their time, so keep the CLI's own
-            // diagnosis when it offered one.
+            // failure kind, but never forward arbitrary captured stderr.
             let stderr = String::from_utf8_lossy(&output.stderr);
             let detail = stderr.trim();
             return Err(if detail.is_empty() || Self::mentions_login(detail) {
                 IfpError::NotLoggedIn
             } else {
-                IfpError::CliFailed(detail.to_string())
+                IfpError::CliFailed(
+                    "Credential source failed; inspect infisical login status for safe diagnostics"
+                        .into(),
+                )
             });
         }
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stdout = String::from_utf8_lossy(&token_bytes);
         Self::extract_jwt(&stdout).ok_or(IfpError::NotLoggedIn)
     }
 

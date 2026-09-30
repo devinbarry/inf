@@ -50,6 +50,14 @@ pub fn json<T: Serialize>(value: &T) {
 /// Confirmation of a mutation, in whichever shape the caller asked for. The
 /// JSON branch is what makes `--json`-less commands like `delete` scriptable.
 pub fn emit<T: Serialize>(format: Format, value: &T, human: impl FnOnce()) {
+    if let Ok(payload) = serde_json::to_value(value) {
+        if crate::disclosure::contains_credential(&payload) {
+            // Human closures can capture raw credentials. Credential results use the same safe
+            // JSON/delivery path in both modes rather than executing those closures.
+            crate::disclosure::emit(payload);
+            return;
+        }
+    }
     if format.is_human() {
         human();
     } else {
