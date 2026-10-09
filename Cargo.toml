@@ -6,7 +6,7 @@
 # is unaffected. Drop that line if the `ifp` name is ever claimed and published.
 [package]
 name = "ifp"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 description = "Infisical control-plane CLI - manage projects, environments and machine identities"
 license = "MIT"

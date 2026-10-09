@@ -5,6 +5,13 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.3] - 2026-10-09
+
+### Security
+
+- Updated dependencies to clear RUSTSEC-2026-0258 (h2) and RUSTSEC-2026-0285 (rustls) with a compatible lockfile
+  refresh. `cargo audit` with warnings denied and a Trivy scan are clean.
+
 ## [0.2.2] - 2026-09-30
 
 ### Changed
