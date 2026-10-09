@@ -109,10 +109,16 @@ fmt:
     cargo fmt
 
 # Run all CI checks locally (fmt, clippy, test)
+# Check dependencies for advisories, licences, bans and sources (needs cargo-deny and cargo-audit)
+audit:
+    cargo deny --locked check
+    cargo audit --deny warnings
+
 check:
     cargo fmt --check
-    cargo clippy --all-targets -- -D warnings
-    cargo test
+    cargo clippy --locked --all-targets -- -D warnings
+    cargo test --locked
+    just audit
 
 # Install binary to ~/.cargo/bin (cargo default)
 install:

@@ -1,0 +1,38 @@
+# cargo-deny policy: run with `just audit` (part of `just check`) and in CI.
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+# Vulnerable and unsound crates always fail; unmaintained and yanked crates fail too.
+unmaintained = "all"
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+confidence-threshold = 0.93
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Unlicense",
+]
+exceptions = [
+    { crate = "colored", allow = ["MPL-2.0"] },  # file-level copyleft; used unmodified
+    { crate = "option-ext", allow = ["MPL-2.0"] },  # file-level copyleft, via dirs; used unmodified
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
