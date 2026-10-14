@@ -109,10 +109,9 @@ fmt:
     cargo fmt
 
 # Run all CI checks locally (fmt, clippy, test)
-# Check dependencies for advisories, licences, bans and sources (needs cargo-deny and cargo-audit)
+# Check dependencies for advisories, licences, bans and sources with cargo-deny, over crates that can be compiled
 audit:
     cargo deny --locked check
-    cargo audit --deny warnings
 
 check:
     cargo fmt --check
