@@ -6,7 +6,7 @@
 # release workflow enables publishing for release tags only.
 [package]
 name = "ifp"
-version = "0.2.3"
+version = "0.3.0"
 edition = "2021"
 description = "Infisical control-plane CLI - manage projects, environments and machine identities"
 license = "MIT"
