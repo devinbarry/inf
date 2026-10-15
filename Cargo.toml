@@ -1,16 +1,22 @@
 # The project, repo and binary are all `inf`. Only the package name differs:
-# `inf` is already taken on crates.io by an unrelated crate, so the package is
-# named `ifp` while the binary installed on PATH stays `inf`.
+# `inf` is already taken on crates.io by an unrelated crate, so the crate is
+# published as `ifp` while the binary installed on PATH stays `inf`.
 #
-# `publish = false` because it is not on crates.io today; `cargo install --path .`
-# is unaffected. Drop that line if the `ifp` name is ever claimed and published.
+# `publish = false` keeps a local `cargo publish` from ever running; the GitHub
+# release workflow enables publishing for release tags only.
 [package]
 name = "ifp"
 version = "0.2.3"
 edition = "2021"
 description = "Infisical control-plane CLI - manage projects, environments and machine identities"
 license = "MIT"
-repository = "https://example.invalid/tools/inf"
+# Only what the crate needs; everything else stays out of crates.io.
+include = ["/src/**/*", "/Cargo.toml", "/Cargo.lock", "/README.md", "/CHANGELOG.md", "/LICENSE"]
+repository = "https://github.com/devinbarry/inf"
+homepage = "https://github.com/devinbarry/inf"
+readme = "README.md"
+keywords = ["infisical", "secrets", "cli", "devops"]
+categories = ["command-line-utilities"]
 publish = false
 
 [[bin]]

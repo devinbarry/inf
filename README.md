@@ -68,8 +68,11 @@ project that already exists.
 ## Install
 
 ```sh
-cargo install --path .
+cargo install ifp   # installs the `inf` binary
 ```
+
+The crate is `ifp` because `inf` is taken on crates.io. From a checkout, `cargo install --locked --path .` does
+the same.
 
 Requires the official `infisical` CLI on `PATH` and an active login.
 
