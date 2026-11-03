@@ -5,6 +5,20 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-11-03
+
+### Added
+
+- `inf project role ls`, `get` and `create`. `create` makes only a read-only secret role for one existing
+  environment and exact folder paths (`--secret-path`, repeatable, default `/`). The server refuses custom roles
+  unless its licence includes RBAC.
+
+### Fixed
+
+- `inf identity get` no longer reports a project-scoped identity's delete protection as `false`. The project
+  membership route omits the field, so `get` now reads it from the project identity route, and fails if that
+  lookup fails. Listings report `null` where the server does not return the field.
+
 ## [0.3.0] - 2026-10-15
 
 ### Added
