@@ -192,6 +192,70 @@ pub async fn identities(client: &InfisicalClient, query: &str, format: Format) -
     Ok(())
 }
 
+// -- Project roles --
+
+pub async fn role_list(client: &InfisicalClient, query: &str, format: Format) -> Result<()> {
+    let projects = client.list_projects().await?;
+    let project = resolve::project(&projects, query)?;
+    let roles = client.list_project_roles(&project.id).await?;
+    output::emit(format, &roles, || {
+        let rows: Vec<Vec<String>> = roles
+            .iter()
+            .map(|role| vec![role.name.clone(), role.slug.clone(), role.id.clone()])
+            .collect();
+        output::table(&["NAME", "SLUG", "ID"], &rows);
+    });
+    Ok(())
+}
+
+pub async fn role_get(
+    client: &InfisicalClient,
+    query: &str,
+    slug: &str,
+    format: Format,
+) -> Result<()> {
+    let projects = client.list_projects().await?;
+    let project = resolve::project(&projects, query)?;
+    let role = client.get_project_role(&project.id, slug).await?;
+    output::emit(format, &role, || output::json(&role));
+    Ok(())
+}
+
+pub async fn role_create(
+    client: &InfisicalClient,
+    query: &str,
+    name: &str,
+    slug: &str,
+    environment: &str,
+    secret_paths: &[String],
+    format: Format,
+) -> Result<()> {
+    if secret_paths.is_empty() || secret_paths.iter().any(|path| !path.starts_with('/')) {
+        return Err(IfpError::Usage(
+            "each --secret-path must start with '/'".into(),
+        ));
+    }
+    let projects = client.list_projects().await?;
+    let matched = resolve::project(&projects, query)?;
+    let project = client.get_project(&matched.id).await?;
+    // Permission conditions contain environment slugs, never IDs, display names,
+    // or fuzzy matches. Reject a typo before creating a permanently unusable role.
+    if !project
+        .environments
+        .iter()
+        .any(|env| env.slug == environment)
+    {
+        return Err(IfpError::Usage(
+            "--environment must be an existing exact environment slug".into(),
+        ));
+    }
+    let role = client
+        .create_secret_reader_role(&project.id, name, slug, environment, secret_paths)
+        .await?;
+    output::emit(format, &role, || output::json(&role));
+    Ok(())
+}
+
 // -- Environments --
 
 pub async fn env_list(client: &InfisicalClient, query: &str, format: Format) -> Result<()> {

@@ -146,9 +146,36 @@ enum ProjectCommands {
         /// Project id, slug, name, or a unique substring
         query: String,
     },
+    /// Manage project roles
+    #[command(subcommand)]
+    Role(ProjectRoleCommands),
     /// Manage environments within a project
     #[command(subcommand)]
     Env(EnvCommands),
+}
+
+#[derive(Subcommand)]
+enum ProjectRoleCommands {
+    /// List roles (use get to inspect permissions)
+    #[command(visible_alias = "list")]
+    Ls { project: String },
+    /// Read a role and its permissions by exact slug
+    Get { project: String, slug: String },
+    /// Create a read-only secret role for one environment and exact folder paths
+    Create {
+        /// Project id, slug, name, or a unique substring
+        project: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        slug: String,
+        /// Exact environment slug; no wildcard or substring matching
+        #[arg(long)]
+        environment: String,
+        /// Exact folder path (repeat for multiple paths); does not include descendants
+        #[arg(long, default_value = "/")]
+        secret_path: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -556,6 +583,32 @@ async fn run(cli: Cli) -> Result<()> {
             ProjectCommands::Identities { query } => {
                 commands::project::identities(&client, &query, format).await
             }
+            ProjectCommands::Role(command) => match command {
+                ProjectRoleCommands::Ls { project } => {
+                    commands::project::role_list(&client, &project, format).await
+                }
+                ProjectRoleCommands::Get { project, slug } => {
+                    commands::project::role_get(&client, &project, &slug, format).await
+                }
+                ProjectRoleCommands::Create {
+                    project,
+                    name,
+                    slug,
+                    environment,
+                    secret_path,
+                } => {
+                    commands::project::role_create(
+                        &client,
+                        &project,
+                        &name,
+                        &slug,
+                        &environment,
+                        &secret_path,
+                        format,
+                    )
+                    .await
+                }
+            },
             ProjectCommands::Env(command) => match command {
                 EnvCommands::Ls { project } => {
                     commands::project::env_list(&client, &project, format).await
@@ -756,6 +809,62 @@ mod tests {
 
     fn parses(args: &[&str]) -> Cli {
         parse(args).unwrap_or_else(|e| panic!("failed to parse {args:?}: {e}"))
+    }
+
+    #[test]
+    fn project_role_commands_are_scoped_and_paths_are_repeatable() {
+        for operation in ["ls", "list"] {
+            parses(&["inf", "project", "role", operation, "billing"]);
+        }
+        parses(&["inf", "project", "role", "get", "billing", "dev-reader"]);
+        let base = [
+            "inf",
+            "project",
+            "role",
+            "create",
+            "billing",
+            "--name",
+            "Dev reader",
+            "--slug",
+            "dev-reader",
+        ];
+        assert!(parse(&base).is_err(), "environment must be explicit");
+        let mut args = base.to_vec();
+        args.extend(["--environment", "dev"]);
+        let cli = parses(&args);
+        let Commands::Project(ProjectCommands::Role(ProjectRoleCommands::Create {
+            secret_path,
+            ..
+        })) = cli.command
+        else {
+            panic!()
+        };
+        assert_eq!(secret_path, ["/"]);
+        args.extend(["--secret-path", "/", "--secret-path", "/service"]);
+        let cli = parses(&args);
+        let Commands::Project(ProjectCommands::Role(ProjectRoleCommands::Create {
+            secret_path,
+            ..
+        })) = cli.command
+        else {
+            panic!()
+        };
+        assert_eq!(secret_path, ["/", "/service"]);
+        let mut args = base.to_vec();
+        args.extend(["--environment", "prod", "--secret-path", "/service"]);
+        let cli = parses(&args);
+        let Commands::Project(ProjectCommands::Role(ProjectRoleCommands::Create {
+            secret_path,
+            ..
+        })) = cli.command
+        else {
+            panic!()
+        };
+        assert_eq!(
+            secret_path,
+            ["/service"],
+            "explicit paths must replace the root default"
+        );
     }
 
     /// Every invocation documented in README.md. These exist so the CLI surface

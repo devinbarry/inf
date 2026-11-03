@@ -171,6 +171,37 @@ Derived slugs keep ASCII letters and digits only. A name with none of those —
 `"Продакшн"`, `"本番"` — is rejected with a pointer to `--slug` rather than
 sending an empty slug to the API.
 
+### Project roles
+
+Create a read-only secret role for an existing environment, then assign its slug
+using `identity create --role` or `identity set-role --role`:
+
+```sh
+inf project role ls billing
+inf project role create billing --name "Dev reader" --slug dev-reader --environment dev
+inf project role create billing --name "Production reader" --slug prod-reader --environment prod --secret-path / --secret-path /service
+inf project role get billing dev-reader
+```
+
+`create` grants only `secrets:describeSecret` and `secrets:readValue`, restricted
+by exact environment slug and exact folder paths. `--secret-path` defaults to
+`/`; repeat it to include several folders. Explicit paths replace the default.
+Descendants are not included and wildcard characters are literal. No write,
+folder-management, import-management, or administrative permissions are granted.
+Use `get` to inspect permissions: the native list endpoint omits them.
+
+These commands reuse the existing login and native project-role API. Creating a
+custom role requires the server's RBAC entitlement and `role:create`; listing or
+reading roles requires `role:read`. Server denial is returned without retrying
+with broader permissions. A role alone grants nothing until assigned to a project
+member or identity. Assign only the intended scoped role: an additional broad
+role can restore access to other environments.
+
+Permission and licence behavior follows Infisical's
+[project permission schema](https://github.com/Infisical/infisical/blob/a762a1e28d36e10ab6cc386d5e9c9a2edd6fc791/backend/src/ee/services/permission/project-permission.ts),
+[project role routes](https://github.com/Infisical/infisical/blob/a762a1e28d36e10ab6cc386d5e9c9a2edd6fc791/backend/src/ee/routes/v1/project-role-router.ts),
+and [role service](https://github.com/Infisical/infisical/blob/a762a1e28d36e10ab6cc386d5e9c9a2edd6fc791/backend/src/services/role/role-service.ts).
+
 ### Machine identities
 
 Identities are **always scoped to a single project**, and default to a
@@ -301,7 +332,7 @@ and no exit code at all.
 Deliberately narrow: the endpoints the official CLI omits and that day-to-day work
 needs.
 
-Not implemented — add as required: roles and groups, secret approval policies,
+Not implemented — add as required: general role editing and groups, secret approval policies,
 webhooks, integrations, secret syncs, app connections, PKI/cert-manager, KMS, PAM.
 
 Deliberately excluded, not merely unimplemented: organization-level identity

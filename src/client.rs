@@ -396,6 +396,75 @@ impl InfisicalClient {
         Ok(response.role)
     }
 
+    // -- Project roles --
+
+    pub async fn list_project_roles(&self, project_id: &str) -> Result<Vec<ProjectRole>> {
+        #[derive(serde::Deserialize)]
+        struct Response {
+            roles: Vec<ProjectRole>,
+        }
+        let response: Response = self
+            .get_json(&format!("/v1/projects/{project_id}/roles"))
+            .await?;
+        Ok(response.roles)
+    }
+
+    pub async fn get_project_role(&self, project_id: &str, slug: &str) -> Result<ProjectRole> {
+        #[derive(serde::Deserialize)]
+        struct Response {
+            role: ProjectRole,
+        }
+        // A role slug is one URL path segment, never an arbitrary request path.
+        if slug.is_empty()
+            || !slug
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+        {
+            return Err(IfpError::Usage(
+                "role slug must contain only letters, digits, '-' or '_'".into(),
+            ));
+        }
+        let response: Response = self
+            .get_json(&format!("/v1/projects/{project_id}/roles/slug/{slug}"))
+            .await?;
+        Ok(response.role)
+    }
+
+    /// Native custom role with exact, mandatory scope and no write permissions.
+    /// The server enforces the RBAC licence and caller's role:create permission.
+    pub async fn create_secret_reader_role(
+        &self,
+        project_id: &str,
+        name: &str,
+        slug: &str,
+        environment: &str,
+        secret_paths: &[String],
+    ) -> Result<ProjectRole> {
+        #[derive(serde::Deserialize)]
+        struct Response {
+            role: ProjectRole,
+        }
+        let response: Response = self
+            .send_json(
+                Method::POST,
+                &format!("/v1/projects/{project_id}/roles"),
+                &json!({
+                    "name": name,
+                    "slug": slug,
+                    "permissions": [{
+                        "subject": "secrets",
+                        "action": ["describeSecret", "readValue"],
+                        "conditions": {
+                            "environment": {"$eq": environment},
+                            "secretPath": {"$in": secret_paths},
+                        },
+                    }],
+                }),
+            )
+            .await?;
+        Ok(response.role)
+    }
+
     // -- Environments --
 
     pub async fn create_environment(

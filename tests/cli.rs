@@ -1161,3 +1161,200 @@ fn credential_issuance_requires_a_destination_before_authentication() {
         "secret_exposure_acknowledgement_required"
     );
 }
+
+#[tokio::test]
+async fn secret_reader_role_has_only_exact_environment_and_folder_access() {
+    let mut server = mockito::Server::new_async().await;
+    let projects = server
+        .mock("GET", "/api/v1/projects")
+        .with_status(200)
+        .with_body(r#"{"projects":[{"id":"p1","name":"Billing","slug":"billing"}]}"#)
+        .create_async()
+        .await;
+    let project = server.mock("GET", "/api/v1/projects/p1")
+        .with_status(200).with_body(r#"{"project":{"id":"p1","name":"Billing","slug":"billing","environments":[{"id":"e1","name":"Development","slug":"dev"},{"id":"e2","name":"Production","slug":"prod"}]}}"#)
+        .create_async().await;
+    let role = server.mock("POST", "/api/v1/projects/p1/roles")
+        .match_header("authorization", format!("Bearer {}", session_token()).as_str())
+        .match_body(mockito::Matcher::Json(serde_json::json!({
+            "name": "Dev reader", "slug": "dev-reader",
+            "permissions": [{"subject": "secrets", "action": ["describeSecret", "readValue"],
+                "conditions": {"environment": {"$eq": "dev"}, "secretPath": {"$in": ["/", "/service"]}}}],
+        })))
+        .with_status(200).with_body(r#"{"role":{"id":"r1","name":"Dev reader","slug":"dev-reader","permissions":[{"subject":"secrets","action":["describeSecret","readValue"],"conditions":{"environment":{"$eq":"dev"},"secretPath":{"$in":["/","/service"]}}}]}}"#)
+        .create_async().await;
+    let out = Run::new(&server.url()).exec(&[
+        "project",
+        "role",
+        "create",
+        "billing",
+        "--name",
+        "Dev reader",
+        "--slug",
+        "dev-reader",
+        "--environment",
+        "dev",
+        "--secret-path",
+        "/",
+        "--secret-path",
+        "/service",
+    ]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stderr(&out).is_empty());
+    let result = stdout_json(&out);
+    assert_eq!(result["slug"], "dev-reader");
+    assert_eq!(
+        result["permissions"][0]["conditions"]["environment"]["$eq"],
+        "dev"
+    );
+    projects.assert_async().await;
+    project.assert_async().await;
+    role.assert_async().await;
+}
+
+#[tokio::test]
+async fn secret_reader_role_rejects_unknown_environment_without_mutation() {
+    let mut server = mockito::Server::new_async().await;
+    server
+        .mock("GET", "/api/v1/projects")
+        .with_status(200)
+        .with_body(r#"{"projects":[{"id":"p1","name":"Billing","slug":"billing"}]}"#)
+        .create_async()
+        .await;
+    server.mock("GET", "/api/v1/projects/p1").with_status(200)
+        .with_body(r#"{"project":{"id":"p1","name":"Billing","slug":"billing","environments":[{"id":"e1","name":"Development","slug":"dev"}]}}"#).create_async().await;
+    let mutation = server
+        .mock("POST", "/api/v1/projects/p1/roles")
+        .expect(0)
+        .create_async()
+        .await;
+    let run = Run::new(&server.url());
+    for environment in ["", "d", "Development", "e1", "*"] {
+        let out = run.exec(&[
+            "project",
+            "role",
+            "create",
+            "billing",
+            "--name",
+            "Reader",
+            "--slug",
+            "reader",
+            "--environment",
+            environment,
+        ]);
+        assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+        assert!(stdout(&out).is_empty());
+    }
+    mutation.assert_async().await;
+}
+
+#[tokio::test]
+async fn project_roles_list_and_get_expose_native_metadata_and_permissions() {
+    let mut server = mockito::Server::new_async().await;
+    server
+        .mock("GET", "/api/v1/projects")
+        .with_status(200)
+        .with_body(r#"{"projects":[{"id":"p1","name":"Billing","slug":"billing"}]}"#)
+        .create_async()
+        .await;
+    let list = server
+        .mock("GET", "/api/v1/projects/p1/roles")
+        .with_status(200)
+        .with_body(r#"{"roles":[{"id":"r1","name":"Reader","slug":"reader"}]}"#)
+        .create_async()
+        .await;
+    let get = server.mock("GET", "/api/v1/projects/p1/roles/slug/reader").with_status(200)
+        .with_body(r#"{"role":{"id":"r1","name":"Reader","slug":"reader","permissions":[{"subject":"secrets","action":["readValue","describeSecret"],"conditions":{"environment":{"$eq":"dev"}}}]}}"#).create_async().await;
+    let run = Run::new(&server.url());
+    let out = run.exec(&["project", "role", "ls", "billing"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout_json(&out)[0]["slug"], "reader");
+    let out = run.exec(&["project", "role", "get", "billing", "reader"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        stdout_json(&out)["permissions"][0]["conditions"]["environment"]["$eq"],
+        "dev"
+    );
+    list.assert_async().await;
+    get.assert_async().await;
+}
+
+#[tokio::test]
+async fn project_role_server_denial_is_sanitized_and_never_falls_back() {
+    let mut server = mockito::Server::new_async().await;
+    server
+        .mock("GET", "/api/v1/projects")
+        .with_status(200)
+        .with_body(r#"{"projects":[{"id":"p1","name":"Billing","slug":"billing"}]}"#)
+        .create_async()
+        .await;
+    server.mock("GET", "/api/v1/projects/p1").with_status(200)
+        .with_body(r#"{"project":{"id":"p1","name":"Billing","slug":"billing","environments":[{"id":"e1","name":"Dev","slug":"dev"}]}}"#).create_async().await;
+    for status in [400, 403] {
+        let mutation = server
+            .mock("POST", "/api/v1/projects/p1/roles")
+            .with_status(status)
+            .with_body(r#"{"message":"synthetic-private-credential"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let out = Run::new(&server.url()).exec(&[
+            "project",
+            "role",
+            "create",
+            "billing",
+            "--name",
+            "Reader",
+            "--slug",
+            "reader",
+            "--environment",
+            "dev",
+        ]);
+        assert_eq!(out.status.code(), Some(1));
+        assert!(stdout(&out).is_empty());
+        assert!(!stderr(&out).contains("synthetic-private-credential"));
+        assert!(serde_json::from_str::<serde_json::Value>(&stderr(&out)).is_ok());
+        mutation.assert_async().await;
+    }
+}
+
+#[tokio::test]
+async fn role_scope_input_cannot_become_an_unscoped_grant_or_request_path() {
+    let mut server = mockito::Server::new_async().await;
+    server
+        .mock("GET", "/api/v1/projects")
+        .with_status(200)
+        .with_body(r#"{"projects":[{"id":"p1","name":"Billing","slug":"billing"}]}"#)
+        .create_async()
+        .await;
+    let mutation = server
+        .mock("POST", "/api/v1/projects/p1/roles")
+        .expect(0)
+        .create_async()
+        .await;
+    let run = Run::new(&server.url());
+    for path in ["", "service", "*"] {
+        let out = run.exec(&[
+            "project",
+            "role",
+            "create",
+            "billing",
+            "--name",
+            "Reader",
+            "--slug",
+            "reader",
+            "--environment",
+            "dev",
+            "--secret-path",
+            path,
+        ]);
+        assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+        assert!(stdout(&out).is_empty());
+    }
+    for slug in ["", "../admin", "reader?foo=bar", "reader#fragment"] {
+        let out = run.exec(&["project", "role", "get", "billing", slug]);
+        assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+        assert!(stdout(&out).is_empty());
+    }
+    mutation.assert_async().await;
+}
