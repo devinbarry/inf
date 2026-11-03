@@ -182,8 +182,10 @@ pub struct Identity {
     pub name: String,
     #[serde(rename = "authMethods", default)]
     pub auth_methods: Vec<String>,
+    /// `None` when the route omits the field: the project membership routes do,
+    /// so defaulting to `false` reported protected identities as unprotected.
     #[serde(rename = "hasDeleteProtection", default)]
-    pub has_delete_protection: bool,
+    pub has_delete_protection: Option<bool>,
 }
 
 /// Returned once, at creation. The secret itself is never retrievable again,

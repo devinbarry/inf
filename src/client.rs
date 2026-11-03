@@ -1,8 +1,8 @@
 use crate::config::Config;
 use crate::error::{IfpError, Result};
 use crate::models::{
-    ClientSecret, IdentityMembership, Project, ProjectRole, SshCa, SshCertificateTemplate,
-    UniversalAuthConfig,
+    ClientSecret, Identity, IdentityMembership, Project, ProjectRole, SshCa,
+    SshCertificateTemplate, UniversalAuthConfig,
 };
 use reqwest::{Method, StatusCode};
 use serde::de::DeserializeOwned;
@@ -619,6 +619,25 @@ impl InfisicalClient {
             &body,
         )
         .await
+    }
+
+    /// Read a project-scoped identity. Unlike the membership routes, this one
+    /// returns `hasDeleteProtection`.
+    pub async fn get_project_identity(
+        &self,
+        project_id: &str,
+        identity_id: &str,
+    ) -> Result<Identity> {
+        #[derive(serde::Deserialize)]
+        struct Response {
+            identity: Identity,
+        }
+        let response: Response = self
+            .get_json(&format!(
+                "/v1/projects/{project_id}/identities/{identity_id}"
+            ))
+            .await?;
+        Ok(response.identity)
     }
 
     /// Delete a project-scoped identity. The organization route refuses these

@@ -134,8 +134,22 @@ pub async fn get(
         Err(err) => return Err(err),
     };
 
+    // The project membership route omits hasDeleteProtection, so read it from the
+    // project identity route. An error fails the command rather than reporting a
+    // protected identity as unprotected.
+    let delete_protection = match &scope.project {
+        Some(project) => {
+            client
+                .get_project_identity(&project.id, identity.id())
+                .await?
+                .has_delete_protection
+        }
+        None => identity.identity.has_delete_protection,
+    };
+
     let mut payload = identity.to_payload();
     payload["authMethods"] = json!(identity.identity.auth_methods);
+    payload["identity"]["hasDeleteProtection"] = json!(delete_protection);
     match &scope.project {
         Some(project) => {
             payload["scope"] = json!("project");
@@ -161,6 +175,12 @@ pub async fn get(
             }
         }
         println!("{} {}", "Auth methods:".bold(), identity.auth_methods());
+        let protection = match delete_protection {
+            Some(true) => "on",
+            Some(false) => "off",
+            None => "unknown",
+        };
+        println!("{} {}", "Delete protection:".bold(), protection);
         if let Some(created) = &identity.created_at {
             println!("{} {}", "Created:".bold(), created);
         }

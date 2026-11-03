@@ -668,6 +668,12 @@ async fn identity_get_reports_universal_auth_for_a_project_scoped_identity() {
         .expect(1)
         .create_async()
         .await;
+    server
+        .mock("GET", "/api/v1/projects/p1/identities/i1")
+        .with_status(200)
+        .with_body(r#"{"identity":{"id":"i1","name":"ci","hasDeleteProtection":false}}"#)
+        .create_async()
+        .await;
 
     let run = Run::new(&server.url());
     let output = run.exec(&["identity", "get", "ci", "--project", "billing"]);
@@ -678,6 +684,102 @@ async fn identity_get_reports_universal_auth_for_a_project_scoped_identity() {
     assert_eq!(json["clientId"], "cid-123");
     assert_eq!(json["role"], "viewer");
     assert_eq!(json["scope"], "project");
+}
+
+/// A project-scoped identity: membership listing without hasDeleteProtection,
+/// Universal Auth not attached, and the project identity route answering `status`.
+async fn project_identity_server(status: usize, body: &str) -> mockito::ServerGuard {
+    let mut server = mockito::Server::new_async().await;
+    server
+        .mock("GET", "/api/v1/projects")
+        .with_status(200)
+        .with_body(TWO_PROJECTS)
+        .create_async()
+        .await;
+    server
+        .mock("GET", "/api/v1/projects/p1/memberships/identities")
+        .match_query(mockito::Matcher::Any)
+        .with_status(200)
+        .with_body(
+            r#"{"identityMemberships":[{"identityId":"i1","roles":[{"role":"viewer"}],
+               "identity":{"id":"i1","name":"ci","authMethods":[]}}]}"#,
+        )
+        .create_async()
+        .await;
+    server
+        .mock("GET", "/api/v1/auth/universal-auth/identities/i1")
+        .with_status(404)
+        .with_body(r#"{"message":"not found"}"#)
+        .create_async()
+        .await;
+    server
+        .mock("GET", "/api/v1/projects/p1/identities/i1")
+        .with_status(status)
+        .with_body(body)
+        .create_async()
+        .await;
+    server
+}
+
+#[tokio::test]
+async fn identity_get_reads_delete_protection_for_a_project_scoped_identity() {
+    // The membership route omits the field; defaulting it reported a protected
+    // identity as unprotected, so a delete was attempted and refused.
+    let server = project_identity_server(
+        200,
+        r#"{"identity":{"id":"i1","name":"ci","hasDeleteProtection":true}}"#,
+    )
+    .await;
+
+    let run = Run::new(&server.url());
+    let output = run.exec(&["identity", "get", "ci", "--project", "billing"]);
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert_eq!(
+        stdout_json(&output)["identity"]["hasDeleteProtection"],
+        true
+    );
+}
+
+#[tokio::test]
+async fn identity_get_fails_when_the_delete_protection_lookup_errors() {
+    let server = project_identity_server(500, r#"{"message":"boom"}"#).await;
+
+    let run = Run::new(&server.url());
+    let output = run.exec(&["identity", "get", "ci", "--project", "billing"]);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+}
+
+#[tokio::test]
+async fn identity_get_keeps_delete_protection_from_the_organization_listing() {
+    let mut server = mockito::Server::new_async().await;
+    server
+        .mock("GET", "/api/v1/identities")
+        .match_query(mockito::Matcher::Any)
+        .with_status(200)
+        .with_body(
+            r#"{"identities":[{"identityId":"i1","role":"member",
+               "identity":{"id":"i1","name":"ci","authMethods":[],"hasDeleteProtection":true}}]}"#,
+        )
+        .create_async()
+        .await;
+    server
+        .mock("GET", "/api/v1/auth/universal-auth/identities/i1")
+        .with_status(404)
+        .with_body(r#"{"message":"not found"}"#)
+        .create_async()
+        .await;
+
+    let run = Run::new(&server.url());
+    let output = run.exec(&["identity", "get", "ci"]);
+
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert_eq!(
+        stdout_json(&output)["identity"]["hasDeleteProtection"],
+        true
+    );
 }
 
 #[tokio::test]
